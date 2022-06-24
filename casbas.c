@@ -195,16 +195,17 @@ static void StripLabel (BuffData *b, BuffData *label)
     BuffData btmp= *b;
     BuffData mylabel= {NULL, 0};
 
-    if (!label) label= &mylabel;
-    label->len= 0;
-    GetWord (&btmp, label);
-    if (label->len==5 &&
-        isxdigit((unsigned char)label->ptr[0]) &&
-        isxdigit((unsigned char)label->ptr[1]) &&
-        isxdigit((unsigned char)label->ptr[2]) &&
-        isxdigit((unsigned char)label->ptr[3]) &&
-        label->ptr[4]==':') {
+    GetWord (&btmp, &mylabel);
+    if (mylabel.len==5 &&
+        isxdigit((unsigned char)mylabel.ptr[0]) &&
+        isxdigit((unsigned char)mylabel.ptr[1]) &&
+        isxdigit((unsigned char)mylabel.ptr[2]) &&
+        isxdigit((unsigned char)mylabel.ptr[3]) &&
+        mylabel.ptr[4]==':') {
         *b= btmp;
+        if (label) *label= mylabel;
+    } else {
+        if (label) label->len= 0;
     }
 }
 
