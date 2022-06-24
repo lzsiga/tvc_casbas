@@ -1,0 +1,128 @@
+<html>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; CharSet=iso-8859-2"/>
+<title>CASBAS.EXE - konverziós program</title>
+<body>
+<H2>CASBAS - Konverziós program</H2>
+
+Ez a program a TVC-BASIC bináris file-ját (CAS) alakítja
+olvasható szövegfile-lá (BAS), vagy fordítva.<br>
+Például akkor lehet haszna, ha szeretnénk egy BASIC játékban
+hibát keresni, vagy különböző verziókat összehasonlítani.
+
+<H2>Némi információ kérdés-válasz formában...</H2>
+
+<a href="#P">a programról</a><br>
+<a href="#B">a program által előállított BAS-file-okról</a><br>
+<a href="#C">a CAS file-okról</a><br>
+<a href="#T">a TVC-BASIC-ről</a><br>
+
+<a name="P"><H3>A programról</H3></a>
+
+<P><B>K:</B> Hogyan lehet a CAS-fileból előállítani a BAS-t?<BR>
+<B>V:</B> Három lehetőség:<br>
+&nbsp;CASBAS &lt;input&gt;.CAS - létrejön az &lt;input&gt;.BAS file, ha még nem létezett<br>
+&nbsp;CASBAS -o &lt;input&gt;.CAS - létrejön az &lt;input&gt;.BAS file, ha létezett, felülíródik<br>
+&nbsp;CASBAS &lt;input&gt;.CAS &lt;output&gt; - létrejön az &lt;output&gt; file, ha létezett, felülíródik
+
+<P><B>K:</B> Hogyan lehet a BAS-fileból előállítani a CAS-t?<BR>
+<B>V:</B> Három lehetőség:<br>
+&nbsp;CASBAS &lt;input&gt;.BAS          - létrejön az &lt;input&gt;.CAS file, ha még nem létezett<br>
+&nbsp;CASBAS -o &lt;input&gt;.BAS       - létrejön az &lt;input&gt;.CAS file, ha létezett, felülíródik<br>
+&nbsp;CASBAS &lt;input&gt;.BAS &lt;output&gt; - létrejön az &lt;output&gt; file, ha létezett, felülíródik
+
+<P><B>K:</B> Tehát a "-o" felülírást (overwrite) jelent?<BR>
+<B>V:</B> Igen, de csak akkor van jelentősége, ha nem adtad meg az output-file nevét.
+
+<P><B>K:</B> A kiterjesztés csak 'CAS' vagy 'BAS' lehet?<BR>
+<B>V:</B> Igen, mivel ebből tudja a program, hogy mit kell csinálnia.
+
+<P><B>K:</B> A CASBAS.EXE program Windows-ban is működik?<BR>
+<B>V:</B> Egy DOS-ablakot kell hozzá nyitni.
+
+<P><B>K:</B> UNIX-ban nem használható?<BR>
+<B>V:</B> A forrásprogramot ott is lefordíthatod, ha van C-compiler.
+
+<P><B>K:</B> Milyen kódkészletet használ a CASBAS.EXE?<BR>
+<B>V:</B> A 20-7E ASCII-kódokat és a latin2 szerinti magyar ékezetes betűket.
+
+<P><B>K:</B> A program csak TVC-s file-okhoz használható?<BR>
+<B>V:</B> Igen.
+
+<P><B>K:</B> Ismeri 64K+ gépek tokenjeit is?<BR>
+<B>V:</B> Az alábbiakat: POLIGON, RECTANGLE, ELLIPSE, AUTO, FKEY, RENUMBER, EXCEPTION.
+
+<P><B>K:</B> Ki és mikor készítette a CASBAS programot?<BR>
+<B>V:</B> Lőrinczy Zsigmond, 2005. júliusában.
+
+<a name="B"><h3>A program által előállított BAS-file-okról</h3></a>
+
+<P><B>K:</B> Mit jelent az a program outputjában, hogy "BYTES"?<BR>
+<B>V:</B> Azt, hogy a BASIC program vége mögött még van 'valami'...
+   mondjuk adat vagy gépi kód.
+
+<P><B>K:</B> Mit jelent az, hogy "AUTORUN"?<BR>
+<B>V:</B> Azt, hogy a CAS-header-ben az 'automatikus indítás' jelző be van állítva.
+
+<P><B>K:</B> Mit jelent az, hogy <i>\t**</i>?<BR>
+<B>V:</B> Olyan TVC-s kódot, aminek nincs ASCII megfelelője... a 't' után két hexa
+   számjegy áll. Lehetséges értékei \t7f..\tdf (inputnál \t20..\tdf.
+
+<P><B>K:</B> Mit jelent az, hogy <i>\x**</i>?<BR>
+<B>V:</B> Olyen kódot, aminek még a TVC kódkészletben sincs megfelelője...
+   valószínűleg adat, vagy gépi kód.
+   Lehetséges értékei \x00..\x1f, \xe0..\xff (inputnál \x00..\xff).
+
+<P><B>K:</B> Mi a különbség a <i>\t**</i> és a <i>\x**</i> között?<BR>
+<B>V:</B> A tokenizált programban a 80H-9FH közötti kódok helyett 00H-1FH szerepel.
+   Ez az átkódolás megtörténik a \t** esetén, de nem történik meg a \x** esetén.
+   Tehát ha azt látjuk, hogy \t8F\t9F\x8F\x9F, akkor a CAS-fileban 0F1F8F9F van.
+
+<P><B>K:</B> Ez elég zavaros...<BR>
+<B>V:</B> Sajnos igen, viszont így a CAS->BAS konverzió (remélhetőleg) információ-
+   vesztés nélkül megoldható, még gépi kódú programrészek esetén is.
+
+<a name="C"><h3>A CAS-file-okról</h3></a>
+
+<P><B>K:</B> Egyes CAS file-ok nagyobbak, mint amit a programméret indokol,
+miért?<BR>
+<B>V:</B> Valószínűleg UPM-ből (az egy CP/M klón) származnak, ott a file-méretet 128 byte-os
+   szektorokban számolják, az utolsó szektor használatlan részét 1A karakterekkel töltik ki.
+
+<P><B>K:</B> Ez az 1A ismerős nekem! Ez nem a Control+Z, ami a file-ok végén szokott lenni?<BR>
+<B>V:</B> Igen, ez az, csak annyi a gond vele hogy DOS-ban (Windows-ban) nincs rá szükség, mivel
+   itt a file méretét pontosan (byte-ban) tárolja a rendszer.</P>
+
+<P><B>K:</B> Hogyan értelmezi a program a CAS fejrészt?<BR>
+<B>V:</B> Nézd meg a TVC.H-ban a CPMHDR, PRGFILEHDR és CASHDR struktúrákat.</P>
+
+<a name="T"><h3>A TV-BASIC-ről</h3></a>
+<P><B>K:</B> Mekkora a maximális sorszám a TV-BASIC-ben?<BR>
+<B>V:</B> Hivatalosan 9999, ennél nagyobbat csak kerülő úton tudsz előállítani.</P>
+
+<P><B>K:</B> Pédául?<BR>
+<B>V:</B> Például a BAS->CAS konverzióval... így különösebb gond nélkül előjuthatsz
+   32767-ig. Persze ezt csak akkor ajánlom, ha valami komoly okod van rá...</P>
+
+<P><B>K:</B> És ha én 65535-ig szeretnék eljutni?<BR>
+<B>V:</B> Az sem lehetetlen, de a 32768-65535 közötti sorokra nem tudsz a programban
+   hivatkozni (pl GOTO).</P>
+
+<P><B>K:</B> Milyen hosszú lehet egy tokenizált BASIC sor?<BR>
+<B>V:</B> A végső korlát az egybyte-os hossztényező miatt 255, ebből három a fejrész,
+   egy a terminátor, marad 251 felhasználói adat...</P>
+
+<P><B>K:</B> Mi az a fejrész?<BR>
+<B>V:</B> Sorhossz egy byte-on (önmagát is tartalmazva), sorszám két byte-on.</P>
+
+<P><B>K:</B> És a terminátor?<BR>
+<B>V:</B> Egy byte FF a sor végén, a program végén pedig 00.</P>
+
+<P><B>K:</B> Igaz, hogy a TV-BASIC mindent nagybetűsít?<BR>
+<B>V:</B> Nem, az alábbi helyeken nem nagybetűsít: macskakörmök között, DATA-ban,
+   megjegyzésben (REM, illetve !).</P>
+
+<P><B>K:</B> Hogyan lehet olyan sort előállítani, amelyben nincs semmi?<BR>
+<B>V:</B> A sorszám után írjál egy szóközt, és nyomj Enter-t. Azt nem tudom, hogy mire
+   jó egy ilyen sor.</P>
+</body>
+</html>
