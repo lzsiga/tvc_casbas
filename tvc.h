@@ -13,21 +13,22 @@
     ((unsigned char *)(ptr))[1] = (unsigned char)(((unsigned short)(value))>>8); \
     }
 
+/* tape block-header */
 typedef struct TBLOCKHDR {
     unsigned char magic1;       /* offset: 0x00, length: 1, value: 0x00 */
-    unsigned char magic2;       /* offset: 0x01, length: 1, value: 0x6A */
+    unsigned char magic2;       /* offset: 0x01, length: 1, value: 0x6A 0b01101010 */
     unsigned char blocktype;    /* offset: 0x02, length: 1 */
     unsigned char filetype;     /* offset: 0x03, length: 1 */
-    unsigned char protect;      /* offset: 0x04, length: 1 */
-    unsigned char nsect;        /* offset: 0x05, length: 1 */
+    unsigned char protect;      /* offset: 0x04, length: 1 0 = not protected*/
+    unsigned char nsect;        /* offset: 0x05, length: 1 number of sectors*/
 } TBLOCKHDR;
 
-#define TBLOCKHDR_MAGIC1      0x00
-#define TBLOCKHDR_MAGIC2      0x6a
-#define TBLOCKHDR_BLOCK_HEAD  0xff
-#define TBLOCKHDR_BLOCK_DATA  0x00
-#define TBLOCKHDR_FILE_BUFF   0x01 /* data */
-#define TBLOCKHDR_FILE_UNBUFF 0x11 /* code */
+#define TBLOCKHDR_MAGIC1      0x00 /* offset 0x00 */
+#define TBLOCKHDR_MAGIC2      0x6a /* offset 0x01 */
+#define TBLOCKHDR_BLOCK_HEAD  0xff /* offset 0x02 (nsect is 1) */
+#define TBLOCKHDR_BLOCK_DATA  0x00 /* offset 0x02 */
+#define TBLOCKHDR_FILE_BUFF   0x01 /* offset 0x03: data - buffered (buffersize: 256byte) */
+#define TBLOCKHDR_FILE_UNBUFF 0x11 /* offset 0x03: code - not buffered (contigous) */
 
 typedef struct TSECTHDR {
     unsigned char sectno;        /* offset: 0x00, length: 1, 0- */
@@ -35,9 +36,32 @@ typedef struct TSECTHDR {
 } TSECTHDR;
 
 typedef struct TSECTEND {
-    unsigned char eof;           /* offset: 0x00, length: 1 */
+    unsigned char eof;           /* offset: 0x00, length: 1; 0==EOF */
     unsigned char crc [2];       /* offset: 0x01, length: 2 */
 } TSECTEND;
+
+/* sector layout:
+   TSECTHDR 2 bytes
+   data     1..256 bytes
+   TSECTEND 3 bytes
+ */
+
+/* headerblock-layout:
+   TBLOCKHDR 6 bytes (blocktype==TBLOCKHDR_BLOCK_HEAD)
+   TSECTHDR  2 bytes (sectno==0)
+   fnamelen  1 byte  (max 10)
+   fname     0-10 byte
+   PRGFILEHDR 16 byte (csak TBLOCKHDR.filetype==TBLOCKHDR_FILE_UNBUFF esetén)
+   TSECTEND  3 bytes
+ */
+
+/* datablock-layout:
+   TBLOCKHDR 6 bytes (blocktype==TBLOCKHDR_BLOCK_DATA)
+   repeated nsect times:
+     TSECTHDR  2 bytes (sectno==0..)
+     databytes 1-256 bytes
+     TSECTEND  3 bytes
+ */
 
 typedef struct CPMHDR {
     unsigned char magic;         /* offset: 0x00, length: 1 */
