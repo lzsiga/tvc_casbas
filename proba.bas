@@ -4,6 +4,9 @@ AUTORUN
 1000 PRINT "TVC-nosztalgia"
 1010 X$="árvíztûrõ tükörfúrógép"
 1020 GOTO 1010
+1020 REM Egy erdekesseg: a tokenizalas a valtozonevekben
+1030 REM is megtortenik, pl a kovetkezo sorban az 'AT' kulcsszo
+1040 LET OT=HAT
 9000 REM a BASIC-program vége után esetleg adat vagy gépi kód lehet
 9001 REM a BYTES kulcsszóval bevezetve
 BYTES \x0a\x0b\x0c\x0d
