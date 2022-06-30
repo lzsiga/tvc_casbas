@@ -12,3 +12,5 @@ casbas_proba: casbas
 	if cmp proba.cas tmp.cas; then echo OK; else echo Fail; fi
 
 casbas wavread: tvc.h
+
+wavread proba: LDLIBS += -lm

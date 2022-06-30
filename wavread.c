@@ -1,6 +1,7 @@
 /* wavread.c */
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,32 +28,76 @@ typedef struct ByteInfo {
     long cnt;
 } ByteInfo;
 
+/* SIGN | usec | bytes (depending on Hertz) | factor to lead */
+/*      |      | 38400  44100  48000        | */
+/* -----+------+ ---------------------------+--------------- */
+/* lead |  470 | 18.05  20.73  22.56        | 1.00           */
+/* sync |  736 | 28.26  32.46  35.33        | 1.5660         */
+/* bit0 |  552 | 21.20  24.34  26.50        | 1.1745         */
+/* bit1 |  388 | 14.90  17.11  18.62        | 0.8255         */
+
+/* note: 'min' and 'max' might be defined as macro */
+typedef struct lenrange {
+    int minv;
+    int maxv;
+} lenrange;
+
+typedef struct State {
+/* WAV-read */
+    FILE *wfile;
+    int  wavcache;  /* eloreolvasott byte 0..255 (-1/-2 = EOF/nincs) */
+    long wavrdpos;  /* az elobbi pozicioja a file-ban */
+    int state;
+/* the following values are calculated from the measured 'lead'-length */
+    lenrange lead;
+    lenrange sync;
+    lenrange bit0;
+    lenrange bit1;
+} State;
+
+static State GB = {
+/* wfile */ NULL,
+/* wavcache */ 0,
+/* wavrdpos */ 0,
+/* state */ 0,
+/* lead  */ {0, 0},
+/* sync  */ {0, 0},
+/* bit0  */ {0, 0},
+/* bit1  */ {0, 0}
+};
+
 static void ParseArgs (int *pargc, char ***pargv);
+
+static void WavOpen (const char *name);
+static void WavClose(void);
+static int  WavRead (void);
+static size_t WavReadBytes (void *to, size_t len);
 
 static FILE *efopen (const char *name, const char *mode);
 static void  efread (FILE *f, void *buff, size_t len);
 
 static void *emalloc (int n);
 
-static int WaitSync (FILE *f);
+/* 'Zero' is 0x80 in this context; 0x00..0x7f is negative, 0x81..0xff is positive */
+static int WaitZero ();
 
 static long GetHalfImp (FILE *f, HalfImpInfo *inf);
-static long GetImp (FILE *f, ImpInfo *ii);
-static int  GetByte (FILE *f, ByteInfo *inf);
+static long GetImp (ImpInfo *ii);
+static int  GetByte (ByteInfo *inf);
 
-static int GetBytes (FILE *f, void *to, int size);
+static int GetBytes (void *to, int size);
 
 static void Dump (long pos, int n, const void *p);
 
-#define WavRead(c,f)   if ((c=fgetc(f))!=EOF) ++ninwav
-#define WavUnread(c,f) { ungetc (c, f); --ninwav; }
-
 static long ninwav= 0;
 
+#define ACT_WAVREAD 1
 static struct {
+    const char *progname;
     int action;
     int debug;
 } opt = {
+    "wavread",
     0,
     0
 };
@@ -64,9 +109,10 @@ static void WriteCas (size_t len, const void *data);
 static void CloseCas (void);
 static void AbortCas (void);
 
+static void DumpWavBytes (void);
+
 int main (int argc, char **argv)
 {
-    FILE *f;
     char hdr[44];
     int b, ss, i;
     TBLOCKHDR tbh;
@@ -83,14 +129,20 @@ int main (int argc, char **argv)
         fprintf (stderr, "usage: wavread <file>\n");
         exit (8);
     }
-    f = efopen (argv[1], "rb");
+    WavOpen(argv[1]);
+/*    f = efopen (argv[1], "rb");
     efread (f, hdr, sizeof (hdr));
-    ninwav += sizeof (hdr);
+    ninwav += sizeof (hdr); */
 
-    if (opt.action==1) {
+    if (opt.action==ACT_WAVREAD) {
+        (void)hdr;
+        DumpWavBytes();
+        goto VEGE;
+
+    } else if (opt.action==1) {
         ImpInfo ii;
         n= 0;
-        while (GetImp (f, &ii)!=EOF) {
+        while (GetImp (&ii)!=EOF) {
             printf ("%05ld %06lx-%06lx %ld+%ld=%ld\n",
                     ++n, ii.begin, ii.begin + ii.cnt - 1,
                     ii.h, ii.l, ii.cnt);
@@ -100,7 +152,7 @@ int main (int argc, char **argv)
     } else if (opt.action==2) {
         HalfImpInfo ii;
         n= 0;
-        while (GetHalfImp (f, &ii)!=EOF) {
+        while (GetHalfImp (NULL, &ii)!=EOF) {
             printf ("%05ld %06lx-%06lx %c %ld+%2ld = %2ld\n",
                     ++n, ii.begin, ii.begin + ii.totcnt - 1,
                     ii.dir>0 ? '+' : '-', 
@@ -111,39 +163,39 @@ int main (int argc, char **argv)
     } else if (opt.action==3) {
         n= 0;
         for (leave= 0; ! leave; ) {
-            while ((b= GetByte (f, NULL))>=0) {
+            while ((b= GetByte (NULL))>=0) {
                 printf ("%05ld   %02x\n", ++n, b);
-                }
-                printf ("-----\n");
+            }
+            printf ("-----\n");
 
-                leave= WaitSync (f)==EOF;
+            leave= WaitZero ()==EOF;
         }
         goto VEGE;
     }
 
     while (1) {
 HEADWAIT:
-        rc= WaitSync (f);
+        rc= WaitZero ();
         if (rc==EOF) break;
 
         pos = ninwav;
-        GetBytes (f, &tbh, sizeof (tbh));
+        GetBytes (&tbh, sizeof (tbh));
         if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_HEAD, pos)) continue;
 HEADFOUND:
-        GetBytes (f, &tsh, sizeof (tsh));
+        GetBytes (&tsh, sizeof (tsh));
         if ((ss= tsh.size)==0) ss= 256;
-        GetBytes (f, sect, ss);
+        GetBytes (sect, ss);
         printf ("name is \"%.*s\"\n", sect[0], sect+1);
         StartCas (sect[0], sect+1);
         WriteCas (ss-1-sect[0], sect+1+sect[0]);
 
-        GetBytes (f, &tse, sizeof (tse));
+        GetBytes (&tse, sizeof (tse));
         printf ("%lx -----HEAD----END----\n", ninwav);
 
-        WaitSync (f);
+        WaitZero ();
 
         pos = ninwav;
-        GetBytes (f, &tbh, sizeof (tbh));
+        GetBytes (&tbh, sizeof (tbh));
         if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_DATA, pos)) {
             AbortCas ();
             if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_HEAD, pos) == 0)
@@ -153,7 +205,7 @@ HEADFOUND:
         }
         for (i=0; i<tbh.nsect; ++i) {
             pos = ninwav;
-                GetBytes (f, &tsh, sizeof (tsh));
+                GetBytes (&tsh, sizeof (tsh));
             if (tsh.sectno != i+1) {
                 printf ("Bad sector number %d (waited=%d), aborting\n",
                         tsh.sectno, i+1);
@@ -162,17 +214,17 @@ HEADFOUND:
             }
             printf ("%lx -----SECTOR-%d-BEGIN---\n", pos, i+1);
             if ((ss= tsh.size)==0) ss= 256;
-                GetBytes (f, sect, ss);
+                GetBytes (sect, ss);
             WriteCas (ss, sect);
             pos = ninwav;
-                GetBytes (f, &tse, sizeof (tse));
+                GetBytes (&tse, sizeof (tse));
             printf ("%lx -----SECTOR-%d-END---\n", pos, i+1);
         }
         printf ("%lx -----DATA-END---\n", ninwav);
         CloseCas ();
     }
 VEGE:
-    fclose (f);
+    WavClose ();
     return 0;
 }
 
@@ -180,7 +232,10 @@ static int BlockCheck (const TBLOCKHDR *tbh, int type, long pos)
 {
     if (tbh->magic1 != TBLOCKHDR_MAGIC1 ||
         tbh->magic2 != TBLOCKHDR_MAGIC2) {
-        printf ("%lx Wrong block found, ignoring\n", pos);
+        fprintf (stderr,
+            "%lx Wrong block found"
+            " (magic1=%02x[expected=%02x] magic2=%02x[expected=%02x]), ignoring\n",
+            pos, tbh->magic1, TBLOCKHDR_MAGIC1, tbh->magic2, TBLOCKHDR_MAGIC2);
         return -1;
 
     } else if (tbh->blocktype != type) {
@@ -191,7 +246,7 @@ static int BlockCheck (const TBLOCKHDR *tbh, int type, long pos)
     return 0;
 }
 
-static int GetBytes (FILE *f, void *to, int size)
+static int GetBytes (void *to, int size)
 {
     int i;
     unsigned char *p = to;
@@ -201,7 +256,7 @@ static int GetBytes (FILE *f, void *to, int size)
     pos = ninwav;
 
     for (i=0; i<size; ++i) {
-        c= GetByte (f, NULL);
+        c= GetByte (NULL);
         if (c<0) break;
         p[i]= (unsigned char)c;
     }
@@ -227,16 +282,9 @@ static void Dump (long pos, int n, const void *p)
 
 #define MINSYNC 29
 
-static struct GBstate {
-    int state;
-    int ldlen; /* average length of leading pulses e.g. 18 */
-#define GB_lead 0 /* looking for leading (multiples 470 usec pulse (20.727 byte at 44100Hz)) */
-} GB= {
-/* state */ 0,
-/* ldlen */ 0
-};
+static void CalcIntervals (long sum, int n);
 
-static int GetByte (FILE *f, ByteInfo *bi)
+static int GetByte (ByteInfo *bi)
 {
     long pos;
     long cnt;
@@ -245,9 +293,9 @@ static int GetByte (FILE *f, ByteInfo *bi)
     ImpInfo ii;
 
     if (GB.state==0) {
-        unsigned long sum;
+        long sum= 0;
 
-/* szinkront keresunk: 100 db 17 es 25 kozotti impulzus */
+/* szinkront keresunk */
         for (ok= 0, cnt= 0; ok<100; ) {
             if (cnt>=17 && cnt<=25) {
                 ok++;
@@ -256,46 +304,44 @@ static int GetByte (FILE *f, ByteInfo *bi)
                 ok= 0;
                 sum= 0;
             }
-            cnt= GetImp (f, &ii);
+            cnt= GetImp (&ii);
             if (cnt==EOF) return EOF;
         }
-        GB.ldlen= (sum + ok/2)/ok;
-        if (opt.debug >= 1) {
-            fprintf (stderr, "Leading has been found, average len %d\n",
-                     GB.ldlen);
-        }
+        CalcIntervals (sum, ok);
 
-/****   while (cnt>=17 && cnt<=25) { ***/
-        while (cnt<=26) {
-            cnt= GetImp (f, &ii);
+        while (cnt>=GB.lead.minv && cnt<=GB.lead.maxv) {
+            cnt= GetImp (&ii);
             if (cnt==EOF) return EOF;
         }
         GB.state= 1;
         goto S1;
 
     } else if (GB.state==1) {
-        cnt = GetImp (f, &ii);
-S1:        if (cnt<MINSYNC) {
-            fprintf (stderr, "Sync missed (%ld<=%d)\n", cnt, MINSYNC);
+        cnt = GetImp (&ii);
+S1:     if (cnt<GB.sync.minv || cnt>GB.sync.maxv) {
+            fprintf (stderr, "Missed sync (expected %d-%d, found=%ld\n",
+                     GB.sync.minv, GB.sync.maxv, cnt);
             exit (12);
         }
-        printf ("%lx Sync found len=%ld\n", ii.begin, ii.cnt);
+        fprintf (stderr, "%lx Sync found len=%ld\n", ii.begin, ii.cnt);
         GB.state= 2;
         goto S2;
 
     } else if (GB.state==2) {
-S2:        pos = ninwav;
+S2:     pos = ninwav;
         for (bits= 0, byte= 0; bits<8; ++bits) {
             byte >>= 1;
-                cnt = GetImp (f, &ii);
-            if (cnt<=20)      byte |= 128;
-            else if (cnt>=21) byte |= 0;
-            else if (bits==0) { /* Újra synchron jön */
-                GB.state= 0;
-                return -2;
-            } else {
-                fprintf (stderr, "cnt=%ld unknown (at %lx)\n", cnt, ii.begin);
-                exit (44);
+            cnt = GetImp (&ii);
+            if      (cnt>=GB.bit0.minv && cnt<=GB.bit0.maxv) byte |= 0;
+            else if (cnt>=GB.bit1.minv && cnt<=GB.bit1.maxv) byte |= 0x80;
+            else {             /* nem jo adatbit */
+                if (bits==0) { /* szerencsere byte-hataron jott */
+                    GB.state= 0;
+                    return -2;
+                } else {
+                    fprintf (stderr, "cnt=%ld unknown (at %lx)\n", cnt, ii.begin);
+                    exit (44);
+                }
             }
         }
         if (bi) {
@@ -307,12 +353,12 @@ S2:        pos = ninwav;
     return EOF;
 }
 
-static int WaitSync (FILE *f)
+static int WaitZero ()
 {
     int c;
 
     do {
-        WavRead (c, f);
+        c= WavRead ();
         if (c==EOF) return EOF;
     } while (c!=0x80);
 
@@ -325,7 +371,7 @@ static int WaitSync (FILE *f)
     while (c>0x80) { \
         ++hcnt; \
         ++cnt; \
-        WavRead (c, f); \
+        c= WavRead (); \
         if (c==EOF) return EOF; \
     }
 
@@ -333,11 +379,11 @@ static int WaitSync (FILE *f)
     while (c<=0x80) { \
         ++lcnt; \
         ++cnt; \
-        WavRead (c, f); \
+        c= WavRead (); \
         if (c==EOF) return EOF; \
     }
 
-static long GetImp (FILE *f, ImpInfo *inf)
+static long GetImp (ImpInfo *inf)
 {
     int c;
     long cnt, hcnt, lcnt;
@@ -347,7 +393,7 @@ static long GetImp (FILE *f, ImpInfo *inf)
 
 /* Megvárjuk egy impulzus elejét
     do {
-        WavRead (c, f);
+        c= WavRead ();
         if (c==EOF) return EOF;
     } while (c<0x80);
 */
@@ -356,13 +402,13 @@ static long GetImp (FILE *f, ImpInfo *inf)
     hcnt= 0;
     lcnt= 0;
 
-    WavRead (c, f);
+    c= WavRead ();
     if (c==EOF) return EOF;
 
     Neg ();
     Poz ();
 
-    WavUnread (c, f);
+/*  WavUnread (c, f); */
 
     if (inf) {
         inf->begin = pos;
@@ -380,17 +426,18 @@ static long GetHalfImp (FILE *f, HalfImpInfo *inf)
     long cnt, igncnt;
     long pos;
 
+    (void)f;
     pos = ninwav;
     igncnt = 0;
     cnt = 0;
 
 /* Megvárjuk egy impulzus elejét */
-    WavRead (c, f);
+    c= WavRead ();
     if (c==EOF) return EOF;
 
     while (c==0x80) {
         ++igncnt;
-        WavRead (c, f);
+        c= WavRead ();
         if (c==EOF) return EOF;
     }
 
@@ -398,18 +445,18 @@ static long GetHalfImp (FILE *f, HalfImpInfo *inf)
         dir = 1; /* pozitív */
         while (c>=0x7e) {
             ++cnt;
-            WavRead (c, f);
+            c= WavRead ();
             if (c==EOF) return EOF;
         }
     } else {
         dir = -1; /* negatív */
         while (c<=0x82) {
             ++cnt;
-            WavRead (c, f);
-                if (c==EOF) return EOF;
+            c= WavRead ();
+            if (c==EOF) return EOF;
         }
     }
-    WavUnread (c, f);
+/* WavUnread (c, f); */
 
     if (inf) {
         inf->begin = pos;
@@ -454,37 +501,39 @@ static void ParseArgs (int *pargc, char ***pargv)
     int argc;
     char **argv;
     int parse_arg;
-    char *progname;
- 
+
     argc = *pargc;
     argv = *pargv;
     parse_arg = 1;
-    progname = argv[0];
-    opt.action = 0;
-    opt.debug = 0;
- 
+    opt.progname = argv[0];
+
     while (--argc && **++argv=='-' && parse_arg) {
         switch (argv[0][1]) {
         case 'i': case 'I':
-             opt.action = 1;
-             break;
+            opt.action = 1;
+            break;
         case 'h': case 'H':
-             opt.action = 2;
-             break;
+            opt.action = 2;
+            break;
         case 'b': case 'B':
-             opt.action = 3;
-             break;
+            opt.action = 3;
+            break;
         case 'd': case 'D':
-             ++opt.debug;
-             break;
+            ++opt.debug;
+            break;
+        case 'w': case 'W':
+            if (strcasecmp (argv[0], "-wavread")==0) {
+                opt.action= ACT_WAVREAD;
+                break;
+            } goto UNKOPT;
         case 0: case '-': parse_arg = 0; break;
-        default:
+        default: UNKOPT:
             fprintf (stderr, "Unknown option '%s'\n", *argv);
             exit (4);
         }
     }
     ++argc;
-    *--argv = progname;
+    --argv;
     *pargc = argc;
     *pargv = argv;
 }
@@ -545,4 +594,132 @@ static void *emalloc (int n)
     fprintf (stderr, "Out of memory (malloc (%d))\n", n);
     exit (33);
     return NULL;
+}
+
+static void ceil_floor (double base, double fact1, double fact2, int *h1, int *l2)
+{
+    if (base <= 0 || fact1 >= fact2) {
+        fprintf (stderr, "*** ceil_floor: invalid parameters: %g %g %g\n",
+            base, fact1, fact2);
+        exit(12);
+    }
+
+    double v1= base*fact1;
+    double fv1= floor(v1);
+    double cv1= ceil(v1);
+    double fault1c= cv1 - v1;
+
+    double v2= base*fact2;
+    double fv2= floor(v2);
+    double cv2= ceil(v2);
+    double fault2f= v1 - fv2;
+
+    if      (cv1 < fv2) *h1= cv1, *l2= fv2;
+    else if (cv1==cv2)  *h1= fv1, *l2= cv2;
+    else if (fault1c > fault2f + 0.5) *h1= fv1, *l2= fv2;
+    else if (fault2f > fault1c + 0.5) *h1= cv1, *l2= cv2;
+    else *h1= fv1, *l2= cv2;
+}
+
+static const double F_bit1_l = 388.0/470.0 * 0.95;
+static const double F_bit1_h = 388.0/470.0 * 1.05;
+static const double F_bit0_l = 552.0/470.0 * 0.95;
+static const double F_bit0_h = 552.0/470.0 * 1.05;
+static const double F_lead_l =               0.95;
+static const double F_lead_h =               1.05;
+static const double F_sync_l = 736.0/470.0 * 0.95;
+static const double F_sync_h = 736.0/470.0 * 1.05;
+
+static void CalcIntervals (long sum, int n)
+{
+    double i= (double)sum / n;
+
+    GB.bit1.minv= floor(i * F_bit1_l);
+    ceil_floor (i, F_bit1_h, F_lead_l, &GB.bit1.maxv, &GB.lead.minv);
+    ceil_floor (i, F_lead_h, F_bit0_l, &GB.lead.maxv, &GB.bit0.minv);
+    ceil_floor (i, F_bit0_h, F_sync_l, &GB.bit0.maxv, &GB.sync.minv);
+    GB.sync.maxv= ceil(i* F_sync_h);
+
+    if (opt.debug>=1) {
+        printf("intervals: bit1: %d-%d, lead: %d-%d, bit0: %d-%d, sync: %d-%d\n",
+            GB.bit1.minv, GB.bit1.maxv,
+            GB.lead.minv, GB.lead.maxv,
+            GB.bit0.minv, GB.bit0.maxv,
+            GB.sync.minv, GB.sync.maxv);
+    }
+}
+
+static void WavOpen (const char *name)
+{
+    GB.wfile= efopen (name, "rb");
+    GB.wavcache= fgetc (GB.wfile);
+    GB.wavrdpos=  0;
+}
+
+static void WavClose (void)
+{
+    fclose (GB.wfile);
+    GB.wfile= NULL;
+}
+
+static int WavRead (void) {
+    if (GB.wavcache==EOF) return EOF;
+    ++GB.wavrdpos;
+    GB.wavcache= fgetc (GB.wfile);
+    return GB.wavcache;
+}
+
+static size_t WavReadBytes (void *to, size_t len) {
+    if (len==0) return 0;
+    if (GB.wavcache==EOF) return 0;
+    unsigned char *p0= to;
+    unsigned char *plim= p0+len;
+    unsigned char *p= p0;
+    while (p<plim && GB.wavcache != EOF) {
+        *p++ = GB.wavcache;
+        WavRead();
+    }
+    return p - p0;
+}
+
+static void DWB_print (size_t psave, size_t nsave, int csave)
+{
+    if (nsave==1) {
+        printf ("%06lx: %02x\n",
+                (long)psave,
+                (unsigned char)csave);
+    } else {
+        printf ("%06lx= %02x (*%ld)\n",
+                (long)psave,
+                (unsigned char)csave,
+                (long)nsave);
+    }
+}
+
+static void DumpWavBytes (void)
+{
+    unsigned long psave= 0;
+    int csave= 0;
+    int nsave= 0;
+
+    while (GB.wavcache >= 0) {
+        if (nsave==0) {
+            nsave= 1;
+            csave= GB.wavcache;
+            psave= GB.wavrdpos;
+
+        } else if (csave==GB.wavcache) {
+            ++nsave;
+
+        } else {
+            DWB_print (psave, nsave, csave);
+            nsave= 1;
+            csave= GB.wavcache;
+            psave= GB.wavrdpos;
+        }
+        WavRead();
+    }
+    if (nsave>0) {
+        DWB_print (psave, nsave, csave);
+    }
 }
