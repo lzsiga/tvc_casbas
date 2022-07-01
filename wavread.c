@@ -8,6 +8,18 @@
 
 #include "tvc.h"
 
+#define ACT_WAVREAD 1
+#define ACT_SEQREAD 2
+static struct {
+    const char *progname;
+    int action;
+    int debug;
+} opt = {
+    "wavread",
+    0,
+    0
+};
+
 typedef struct ImpInfo {
     long begin;
     long h;
@@ -42,11 +54,38 @@ typedef struct lenrange {
     int maxv;
 } lenrange;
 
+/* sequence-read */
+/* a sequence consist of consecutive positive/negative/zero bytes (here 0x80 is zero) */
+typedef struct Seq {
+    long pos;    /* file-offset */
+    int  sign;   /* -1/0/1 */
+    long len;
+} Seq;
+/* hierachy of read-operations:
+   WavOpen calls WavRead
+   WavOpen sets GB.seq.sta to STA_INIT
+   SeqRead calls WavRead
+ */
+#define STA_FILLED 0
+#define STA_EOF    (-1)
+#define STA_INIT   1
+
 typedef struct State {
 /* WAV-read */
     FILE *wfile;
-    int  wavcache;  /* eloreolvasott byte 0..255 (-1/-2 = EOF/nincs) */
-    long wavrdpos;  /* az elobbi pozicioja a file-ban */
+    struct {        /* WAV file-header: we ignore it, assuming 8bit unsigned @ 44100 Hz */
+        unsigned char bytes[64];
+        unsigned len;
+    } fh;
+    struct {
+        int  sta;             /* 0/-1/1 = next fields are filled / EOF / before the first read */
+        unsigned char cache;  /* eloreolvasott byte */
+        long pos;             /* az elobbi pozicioja a file-ban */
+    } wav;
+    struct {
+        int sta;     /* 0/-1/1 = next field is filled / EOF / before the first read */
+        Seq s;
+    } seq;
     int state;
 /* the following values are calculated from the measured 'lead'-length */
     lenrange lead;
@@ -55,16 +94,10 @@ typedef struct State {
     lenrange bit1;
 } State;
 
-static State GB = {
-/* wfile */ NULL,
-/* wavcache */ 0,
-/* wavrdpos */ 0,
-/* state */ 0,
-/* lead  */ {0, 0},
-/* sync  */ {0, 0},
-/* bit0  */ {0, 0},
-/* bit1  */ {0, 0}
-};
+static State GB;
+
+static FILE *efopen (const char *name, const char *mode);
+static void *emalloc (int n);
 
 static void ParseArgs (int *pargc, char ***pargv);
 
@@ -73,10 +106,7 @@ static void WavClose(void);
 static int  WavRead (void);
 static size_t WavReadBytes (void *to, size_t len);
 
-static FILE *efopen (const char *name, const char *mode);
-static void  efread (FILE *f, void *buff, size_t len);
-
-static void *emalloc (int n);
+static int  SeqRead (void);
 
 /* 'Zero' is 0x80 in this context; 0x00..0x7f is negative, 0x81..0xff is positive */
 static int WaitZero ();
@@ -91,17 +121,6 @@ static void Dump (long pos, int n, const void *p);
 
 static long ninwav= 0;
 
-#define ACT_WAVREAD 1
-static struct {
-    const char *progname;
-    int action;
-    int debug;
-} opt = {
-    "wavread",
-    0,
-    0
-};
-
 static int BlockCheck (const TBLOCKHDR *tbh, int type, long pos);
 
 static void StartCas (size_t namelen, const char *name);
@@ -110,10 +129,10 @@ static void CloseCas (void);
 static void AbortCas (void);
 
 static void DumpWavBytes (void);
+static void DumpSequences (void);
 
 int main (int argc, char **argv)
 {
-    char hdr[44];
     int b, ss, i;
     TBLOCKHDR tbh;
     TSECTHDR  tsh;
@@ -130,13 +149,13 @@ int main (int argc, char **argv)
         exit (8);
     }
     WavOpen(argv[1]);
-/*    f = efopen (argv[1], "rb");
-    efread (f, hdr, sizeof (hdr));
-    ninwav += sizeof (hdr); */
 
     if (opt.action==ACT_WAVREAD) {
-        (void)hdr;
         DumpWavBytes();
+        goto VEGE;
+
+    } else if (opt.action==ACT_SEQREAD) {
+        DumpSequences();
         goto VEGE;
 
     } else if (opt.action==1) {
@@ -482,20 +501,6 @@ static FILE *efopen (const char *name, const char *mode)
     return NULL;
 }
 
-static void efread (FILE *f, void *buff, size_t len)
-{
-    size_t rd;
-
-    errno = 0;
-    rd = fread (buff, 1, len, f);
-    if (rd==len) return;
-    if (errno) {
-        perror ("Error reading file");
-    } else {
-        fprintf (stderr, "fread: not enough data (%u<%u)", (unsigned)rd, (unsigned)len);
-    }
-}
-
 static void ParseArgs (int *pargc, char ***pargv)
 {
     int argc;
@@ -521,11 +526,19 @@ static void ParseArgs (int *pargc, char ***pargv)
         case 'd': case 'D':
             ++opt.debug;
             break;
+
+        case 's': case 'S':
+            if (strcasecmp (argv[0], "-seqread")==0) {
+                opt.action= ACT_SEQREAD;
+                break;
+            } goto UNKOPT;
+
         case 'w': case 'W':
             if (strcasecmp (argv[0], "-wavread")==0) {
                 opt.action= ACT_WAVREAD;
                 break;
             } goto UNKOPT;
+
         case 0: case '-': parse_arg = 0; break;
         default: UNKOPT:
             fprintf (stderr, "Unknown option '%s'\n", *argv);
@@ -652,8 +665,16 @@ static void CalcIntervals (long sum, int n)
 static void WavOpen (const char *name)
 {
     GB.wfile= efopen (name, "rb");
-    GB.wavcache= fgetc (GB.wfile);
-    GB.wavrdpos=  0;
+    GB.wav.sta= STA_INIT;
+    GB.wav.pos= 0;
+    WavRead();
+    GB.seq.sta= STA_INIT;
+
+    GB.fh.len= WavReadBytes (&GB.fh.bytes, sizeof GB.fh.bytes);
+    if (opt.debug>=1) {
+        fprintf (stderr, "Wav-header skipped (%u bytes)\n",
+            (unsigned)GB.fh.len);
+    }
 }
 
 static void WavClose (void)
@@ -663,23 +684,54 @@ static void WavClose (void)
 }
 
 static int WavRead (void) {
-    if (GB.wavcache==EOF) return EOF;
-    ++GB.wavrdpos;
-    GB.wavcache= fgetc (GB.wfile);
-    return GB.wavcache;
+    if (GB.wav.sta==STA_EOF) return EOF;
+    if (GB.wav.sta!=STA_INIT) ++GB.wav.pos;
+    int c= fgetc (GB.wfile);
+    if (c==EOF) {
+        GB.wav.sta= STA_EOF;
+    } else {
+        GB.wav.sta= STA_FILLED;
+        GB.wav.cache= (unsigned char)c;
+    }
+    return c;
 }
 
 static size_t WavReadBytes (void *to, size_t len) {
     if (len==0) return 0;
-    if (GB.wavcache==EOF) return 0;
+    if (GB.wav.sta==STA_EOF) return 0;
     unsigned char *p0= to;
     unsigned char *plim= p0+len;
     unsigned char *p= p0;
-    while (p<plim && GB.wavcache != EOF) {
-        *p++ = GB.wavcache;
+    while (p<plim && GB.wav.sta != EOF) {
+        *p++ = GB.wav.cache;
         WavRead();
     }
     return p - p0;
+}
+
+#define SignOfByte(b) ((b)<0x80 ? (-1) : \
+                       (b)>0x80 ?   1  : 0)
+
+static int SeqRead (void)
+{
+    if (GB.seq.sta == STA_EOF) return EOF;
+    if (GB.wav.sta == STA_EOF) {
+        GB.seq.sta= STA_EOF;
+        return EOF;
+    }
+
+    GB.seq.sta= STA_FILLED;
+    GB.seq.s.pos= GB.wav.pos;
+    GB.seq.s.len= 1;
+    GB.seq.s.sign= SignOfByte (GB.wav.cache);
+    WavRead();
+
+    while (GB.wav.sta == STA_FILLED &&
+           SignOfByte(GB.wav.cache)==GB.seq.s.sign) {
+        ++GB.seq.s.len;
+        WavRead();
+    }
+    return 0;
 }
 
 static void DWB_print (size_t psave, size_t nsave, int csave)
@@ -702,24 +754,40 @@ static void DumpWavBytes (void)
     int csave= 0;
     int nsave= 0;
 
-    while (GB.wavcache >= 0) {
+    while (GB.wav.sta == STA_FILLED) {
         if (nsave==0) {
             nsave= 1;
-            csave= GB.wavcache;
-            psave= GB.wavrdpos;
+            csave= GB.wav.cache;
+            psave= GB.wav.pos;
 
-        } else if (csave==GB.wavcache) {
+        } else if (csave==GB.wav.cache) {
             ++nsave;
 
         } else {
             DWB_print (psave, nsave, csave);
             nsave= 1;
-            csave= GB.wavcache;
-            psave= GB.wavrdpos;
+            csave= GB.wav.cache;
+            psave= GB.wav.pos;
         }
         WavRead();
     }
     if (nsave>0) {
         DWB_print (psave, nsave, csave);
+    }
+}
+
+#define SignToChar(s) ((s)<0 ? '-': \
+                       (s)>0 ? '+': '0')
+
+static void DumpSequences (void)
+{
+    if (GB.seq.sta == STA_INIT) SeqRead();
+
+    while (GB.seq.sta == STA_FILLED) {
+        printf ("%06lx: %c *%ld\n",
+            (long)GB.seq.s.pos,
+            SignToChar (GB.seq.s.sign),
+            (long)GB.seq.s.len);
+        SeqRead();
     }
 }
