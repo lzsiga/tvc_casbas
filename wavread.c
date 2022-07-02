@@ -56,6 +56,10 @@ typedef struct lenrange {
     int maxv;
 } lenrange;
 
+#define IsInInterval(val,plenrange) \
+    (((long)(val)) >= (long)(plenrange)->minv && \
+     ((long)(val)) <= (long)(plenrange)->maxv)
+
 /* sequence-read */
 /* a sequence consist of consecutive positive/negative/zero bytes (here 0x80 is zero) */
 typedef struct Seq {
@@ -890,7 +894,7 @@ static int BitRead_FindSync()
         int rngerr= 0;
         for (i=0; i<leadunit && !rngerr && GB.pulse.sta==STA_FILLED; ++i) {
     /*      printf ("pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
-            rngerr= GB.pulse.p.len<range.minv || GB.pulse.p.len>range.maxv;
+            rngerr= ! IsInInterval (GB.pulse.p.len, &range);
             if (rngerr) continue;
             PulseRead();
         }
@@ -906,8 +910,20 @@ static int BitRead_FindSync()
         return STA_EOF;
     }
     CalcIntervals (headavglen);
-
-    return 0;
+    while (GB.pulse.sta != STA_EOF &&
+           IsInInterval (GB.pulse.p.len, &GB.lead)) {
+        PulseRead();
+    }
+    if (GB.pulse.sta != STA_EOF &&
+           IsInInterval (GB.pulse.p.len, &GB.sync)) {
+        fprintf (stderr, "BitRead_FindSync: found the sync at %06lx (len=%d)\n",
+            (long)GB.pulse.p.pos, (int)GB.pulse.p.len);
+        PulseRead();
+        return 0;
+    } else {
+        GB.bit.sta==STA_EOF;
+        return STA_EOF;
+    }
 }
 
 static int BitRead (void)
@@ -919,7 +935,8 @@ static int BitRead (void)
         return EOF;
     }
     if (GB.bit.sta==STA_INIT) {
-        BitRead_FindSync();
+        rc= BitRead_FindSync();
+        if (rc) return STA_EOF;
     }
     return 0;
 }
