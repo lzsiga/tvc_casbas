@@ -47,20 +47,24 @@ typedef struct TSECTEND {
  */
 
 /* headerblock-layout:
+   (sync: 10240*470usec 1*736 usec)
    TBLOCKHDR 6 bytes (blocktype==TBLOCKHDR_BLOCK_HEAD)
    TSECTHDR  2 bytes (sectno==0)
    fnamelen  1 byte  (max 10)
    fname     0-10 byte
    PRGFILEHDR 16 byte (csak TBLOCKHDR.filetype==TBLOCKHDR_FILE_UNBUFF esetén)
    TSECTEND  3 bytes
+   (lead off: 5*470usec)
  */
 
 /* datablock-layout:
+   (sync: 5120*470usec 1*736 usec)
    TBLOCKHDR 6 bytes (blocktype==TBLOCKHDR_BLOCK_DATA)
    repeated nsect times:
      TSECTHDR  2 bytes (sectno==0..)
      databytes 1-256 bytes
      TSECTEND  3 bytes
+   (lead off: 5*470usec)
  */
 
 typedef struct CPMHDR {

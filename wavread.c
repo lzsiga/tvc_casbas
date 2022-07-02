@@ -8,8 +8,10 @@
 
 #include "tvc.h"
 
-#define ACT_WAVREAD 1
-#define ACT_SEQREAD 2
+#define ACT_WAVREAD   1
+#define ACT_SEQREAD   2
+#define ACT_PULSEREAD 3
+#define ACT_BITREAD   4
 static struct {
     const char *progname;
     int action;
@@ -61,10 +63,35 @@ typedef struct Seq {
     int  sign;   /* -1/0/1 */
     long len;
 } Seq;
+
+/* an impulse: a positive and a negative part together */
+/* (positive-then-negative or negative-then-positive) */
+/* reading impulses starts after a lot of zeroes; */
+/* reading zeroes _after_ valid impulses will return EOF, */
+/* but you can call PulseReadReset to go back to the initial state */
+#define MINZEROES 1000 /* minimum number of 0x80 bytes (silence) before the leader */
+typedef struct Pulse {
+    long pos;    /* file-offset */
+    long len;    /* length: total */
+    long len1, len2;
+} Pulse;
+
+/* a Bit: reading bits is possible after having found a synchron-block */
+/* there is BitReadReset that resets state */
+typedef struct Bit {
+    long pos;    /* file-offset */
+    long len;    /* length */
+    int  val;    /* 0/1 */
+} Bit;
+
 /* hierachy of read-operations:
-   WavOpen calls WavRead
-   WavOpen sets GB.seq.sta to STA_INIT
-   SeqRead calls WavRead
+   WavOpen   calls WavRead
+   WavOpen   sets GB.seq.sta   to STA_INIT
+   WavOpen   sets GB.pulse.sta to STA_INIT
+   WavOpen   sets GB.BIpulse.sta to STA_INIT
+   SeqRead   calls WavRead
+   PulseRead calls SeqRead
+   BitRead   calls PulseRead
  */
 #define STA_FILLED 0
 #define STA_EOF    (-1)
@@ -86,6 +113,14 @@ typedef struct State {
         int sta;     /* 0/-1/1 = next field is filled / EOF / before the first read */
         Seq s;
     } seq;
+    struct {
+        int sta;     /* 0/-1/1 = next field is filled / EOF / before the first read */
+        Pulse p;
+    } pulse;
+    struct {
+        int sta;     /* 0/-1/1 = next field is filled / EOF / before the first read */
+        Bit b;
+    } bit;
     int state;
 /* the following values are calculated from the measured 'lead'-length */
     lenrange lead;
@@ -106,7 +141,9 @@ static void WavClose(void);
 static int  WavRead (void);
 static size_t WavReadBytes (void *to, size_t len);
 
-static int  SeqRead (void);
+static int SeqRead (void);
+static int PulseRead (void);
+static int PulseReadReset (void);
 
 /* 'Zero' is 0x80 in this context; 0x00..0x7f is negative, 0x81..0xff is positive */
 static int WaitZero ();
@@ -130,6 +167,8 @@ static void AbortCas (void);
 
 static void DumpWavBytes (void);
 static void DumpSequences (void);
+static void DumpPulses (void);
+static void DumpBits (void);
 
 int main (int argc, char **argv)
 {
@@ -156,6 +195,14 @@ int main (int argc, char **argv)
 
     } else if (opt.action==ACT_SEQREAD) {
         DumpSequences();
+        goto VEGE;
+
+    } else if (opt.action==ACT_PULSEREAD) {
+        DumpPulses();
+        goto VEGE;
+
+    } else if (opt.action==ACT_BITREAD) {
+        DumpBits();
         goto VEGE;
 
     } else if (opt.action==1) {
@@ -301,7 +348,7 @@ static void Dump (long pos, int n, const void *p)
 
 #define MINSYNC 29
 
-static void CalcIntervals (long sum, int n);
+static void CalcIntervals (double avgheadlen);
 
 static int GetByte (ByteInfo *bi)
 {
@@ -326,7 +373,7 @@ static int GetByte (ByteInfo *bi)
             cnt= GetImp (&ii);
             if (cnt==EOF) return EOF;
         }
-        CalcIntervals (sum, ok);
+        CalcIntervals ((double)sum/ok);
 
         while (cnt>=GB.lead.minv && cnt<=GB.lead.maxv) {
             cnt= GetImp (&ii);
@@ -514,18 +561,27 @@ static void ParseArgs (int *pargc, char ***pargv)
 
     while (--argc && **++argv=='-' && parse_arg) {
         switch (argv[0][1]) {
-        case 'i': case 'I':
-            opt.action = 1;
+        case 'b': case 'B':
+            if (strcasecmp (argv[0], "-bitread")==0) {
+                opt.action= ACT_BITREAD;
+                break;
+            } goto UNKOPT;
+
+        case 'd': case 'D':
+            ++opt.debug;
             break;
         case 'h': case 'H':
             opt.action = 2;
             break;
-        case 'b': case 'B':
-            opt.action = 3;
+        case 'i': case 'I':
+            opt.action = 1;
             break;
-        case 'd': case 'D':
-            ++opt.debug;
-            break;
+
+        case 'p': case 'P':
+            if (strcasecmp (argv[0], "-pulseread")==0) {
+                opt.action= ACT_PULSEREAD;
+                break;
+            } goto UNKOPT;
 
         case 's': case 'S':
             if (strcasecmp (argv[0], "-seqread")==0) {
@@ -641,20 +697,18 @@ static const double F_bit0_h = 552.0/470.0 * 1.05;
 static const double F_lead_l =               0.95;
 static const double F_lead_h =               1.05;
 static const double F_sync_l = 736.0/470.0 * 0.95;
-static const double F_sync_h = 736.0/470.0 * 1.05;
+static const double F_sync_h = 736.0/470.0 * 1.35; /* was: 1.05 */
 
-static void CalcIntervals (long sum, int n)
+static void CalcIntervals (double i)
 {
-    double i= (double)sum / n;
-
-    GB.bit1.minv= floor(i * F_bit1_l);
+    GB.bit1.minv= floor (i * F_bit1_l);
     ceil_floor (i, F_bit1_h, F_lead_l, &GB.bit1.maxv, &GB.lead.minv);
     ceil_floor (i, F_lead_h, F_bit0_l, &GB.lead.maxv, &GB.bit0.minv);
     ceil_floor (i, F_bit0_h, F_sync_l, &GB.bit0.maxv, &GB.sync.minv);
-    GB.sync.maxv= ceil(i* F_sync_h);
+    GB.sync.maxv= ceil (i* F_sync_h);
 
     if (opt.debug>=1) {
-        printf("intervals: bit1: %d-%d, lead: %d-%d, bit0: %d-%d, sync: %d-%d\n",
+        fprintf (stderr, "intervals: bit1: %d-%d, lead: %d-%d, bit0: %d-%d, sync: %d-%d\n",
             GB.bit1.minv, GB.bit1.maxv,
             GB.lead.minv, GB.lead.maxv,
             GB.bit0.minv, GB.bit0.maxv,
@@ -669,6 +723,8 @@ static void WavOpen (const char *name)
     GB.wav.pos= 0;
     WavRead();
     GB.seq.sta= STA_INIT;
+    GB.pulse.sta= STA_INIT;
+    GB.bit.sta= STA_INIT;
 
     GB.fh.len= WavReadBytes (&GB.fh.bytes, sizeof GB.fh.bytes);
     if (opt.debug>=1) {
@@ -734,6 +790,140 @@ static int SeqRead (void)
     return 0;
 }
 
+static int PulseRead (void)
+{
+    Seq sFirst, sNext;
+
+    if (GB.pulse.sta == STA_EOF) return EOF;
+    if (GB.seq.sta==STA_INIT) SeqRead();
+    if (GB.seq.sta==STA_EOF) {
+        GB.pulse.sta= STA_EOF;
+        return EOF;
+    }
+    if (GB.pulse.sta == STA_INIT) {
+        Seq sZero;
+        int foundzeroes= 0;
+
+        while (GB.seq.sta==STA_FILLED && !foundzeroes) {
+            foundzeroes= GB.seq.s.sign==0 && GB.seq.s.len >= MINZEROES;
+            if (foundzeroes) sZero= GB.seq.s;
+            SeqRead();
+        }
+        if (!foundzeroes || GB.seq.sta == STA_EOF) {
+            GB.pulse.sta= STA_EOF;
+            return EOF;
+        }
+        sFirst= GB.seq.s;
+        fprintf(stderr,
+                "PulseRead: found zeroes at"
+                " %06lx (len=%ld), data after it at %06lx\n",
+                sZero.pos, sZero.len, sFirst.pos);
+        sFirst= GB.seq.s;
+    } else {
+        sFirst= GB.seq.s;
+        if (sFirst.sign==0) {
+            fprintf(stderr,
+                "PulseRead: after valid impulse found zeroes at"
+                " %06lx (len=%ld); reset state\n",
+                sFirst.pos, sFirst.len);
+            GB.pulse.sta= STA_EOF;
+            return EOF;
+        }
+    }
+    SeqRead();
+    if (GB.seq.sta==STA_EOF) {
+        fprintf(stderr,
+                "PulseRead: EOF after a half-pulse\n");
+        GB.pulse.sta= STA_EOF;
+        return EOF;
+    }
+    sNext= GB.seq.s;
+    if (sNext.sign==0 || sFirst.sign*sNext.sign != -1) {
+        fprintf(stderr,
+                "The halves of the pulse doesn't match"
+                " p=%06lx/l=%ld/s=%d vs p=%06lx/l=%ld/s=%d\n",
+                (long)sFirst.pos, (long)sFirst.len, (int)sFirst.sign,
+                (long)sNext.pos,  (long)sNext.len,  (int)sNext.sign);
+        GB.pulse.sta= STA_EOF;
+        return EOF;
+    }
+    SeqRead();
+    GB.pulse.p.pos= sFirst.pos;
+    GB.pulse.p.len= sFirst.len + sNext.len;
+    GB.pulse.p.len1= sFirst.len;
+    GB.pulse.p.len2= sNext.len;
+    GB.pulse.sta= STA_FILLED;
+    return 0;
+}
+
+static int PulseReadReset (void)
+{
+    GB.pulse.sta= STA_INIT;
+    return PulseRead();
+}
+
+static int BitRead_FindSync()
+{
+    size_t sumlen;
+    int leadtries= 20, leadunit= 100;
+    int leadfound= 0;
+    int i, j;
+    double headavglen;
+
+    for (j= 0; j<leadtries && !leadfound; ++j) {
+        sumlen= 0;
+        for (i=0; i<leadunit && GB.pulse.sta==STA_FILLED; ++i) {
+    /*      printf ("pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
+            sumlen += GB.pulse.p.len;
+            PulseRead();
+        }
+        if (GB.pulse.sta==STA_EOF) {
+            GB.bit.sta= STA_EOF;
+            return STA_EOF;
+        }
+        headavglen= sumlen/leadunit;
+        lenrange range;
+        range.minv= floor(headavglen*0.95);
+        range.maxv= ceil(headavglen*1.05);
+        fprintf (stderr, "BitRead_FindSync: avg=%g range=[%d,%d]\n", headavglen, range.minv, range.maxv);
+
+        int rngerr= 0;
+        for (i=0; i<leadunit && !rngerr && GB.pulse.sta==STA_FILLED; ++i) {
+    /*      printf ("pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
+            rngerr= GB.pulse.p.len<range.minv || GB.pulse.p.len>range.maxv;
+            if (rngerr) continue;
+            PulseRead();
+        }
+        if (GB.pulse.sta==STA_EOF) {
+            GB.bit.sta= STA_EOF;
+            return STA_EOF;
+        }
+        leadfound= !rngerr;
+    }
+    if (!leadfound) {
+        fprintf (stderr, "BitRead_FindSync: couldn't find the leader\n");
+        GB.bit.sta= STA_EOF;
+        return STA_EOF;
+    }
+    CalcIntervals (headavglen);
+
+    return 0;
+}
+
+static int BitRead (void)
+{
+    if (GB.bit.sta == STA_EOF) return EOF;
+    if (GB.pulse.sta==STA_INIT) PulseRead();
+    if (GB.pulse.sta==STA_EOF) {
+        GB.bit.sta= STA_EOF;
+        return EOF;
+    }
+    if (GB.bit.sta==STA_INIT) {
+        BitRead_FindSync();
+    }
+    return 0;
+}
+
 static void DWB_print (size_t psave, size_t nsave, int csave)
 {
     if (nsave==1) {
@@ -790,4 +980,61 @@ static void DumpSequences (void)
             (long)GB.seq.s.len);
         SeqRead();
     }
+}
+
+static void DP_print (size_t nsave, const Pulse *psave)
+{
+    if (nsave==1) {
+        printf ("%06lx: %ld (%ld+%ld)\n",
+            (long)psave->pos,
+            (long)psave->len,
+            (long)psave->len1,
+            (long)psave->len2);
+    } else {
+        printf ("%06lx= %ld (%ld+%ld) (*%ld)\n",
+            (long)psave->pos,
+            (long)psave->len,
+            (long)psave->len1,
+            (long)psave->len2,
+            (long)nsave);
+    }
+}
+
+static void DumpPulses (void)
+{
+    if (GB.pulse.sta == STA_INIT) PulseRead();
+
+    Pulse pcache;
+    size_t ncache= 0;
+
+ELEJE:
+    while (GB.pulse.sta == STA_FILLED) {
+        if (ncache!=0 &&
+            (GB.pulse.p.len  != pcache.len  ||
+             GB.pulse.p.len1 != pcache.len1 ||
+             GB.pulse.p.len2 != pcache.len2)) {
+            DP_print (ncache, &pcache);
+            ncache= 0;
+        }
+        if (ncache==0) {
+            ncache= 1;
+            pcache= GB.pulse.p;
+        } else {
+            ++ncache;
+        }
+        PulseRead ();
+    }
+    if (ncache!=0) {
+        DP_print (ncache, &pcache);
+        ncache= 0;
+    }
+    if (GB.pulse.sta==STA_EOF && GB.seq.sta!=STA_EOF) {
+        PulseReadReset();
+        goto ELEJE;
+    }
+}
+
+static void DumpBits (void)
+{
+    if (GB.bit.sta == STA_INIT) BitRead();
 }
