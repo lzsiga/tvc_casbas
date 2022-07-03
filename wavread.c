@@ -148,6 +148,8 @@ static size_t WavReadBytes (void *to, size_t len);
 static int SeqRead (void);
 static int PulseRead (void);
 static int PulseReadReset (void);
+static int BitRead (void);
+static int BitReadReset (void);
 
 /* 'Zero' is 0x80 in this context; 0x00..0x7f is negative, 0x81..0xff is positive */
 static int WaitZero ();
@@ -918,10 +920,11 @@ static int BitRead_FindSync()
            IsInInterval (GB.pulse.p.len, &GB.sync)) {
         fprintf (stderr, "BitRead_FindSync: found the sync at %06lx (len=%d)\n",
             (long)GB.pulse.p.pos, (int)GB.pulse.p.len);
+        GB.bit.sta= STA_FILLED;
         PulseRead();
         return 0;
     } else {
-        GB.bit.sta==STA_EOF;
+        GB.bit.sta= STA_EOF;
         return STA_EOF;
     }
 }
@@ -935,10 +938,39 @@ static int BitRead (void)
         return EOF;
     }
     if (GB.bit.sta==STA_INIT) {
-        rc= BitRead_FindSync();
+        int rc= BitRead_FindSync();
         if (rc) return STA_EOF;
     }
+    PulseRead();
+    if (GB.pulse.sta==STA_EOF) {
+        GB.bit.sta= STA_EOF;
+        return EOF;
+    }
+    if (IsInInterval (GB.pulse.p.len, &GB.bit0)) {
+        GB.bit.b.pos= GB.pulse.p.pos;
+        GB.bit.b.len= GB.pulse.p.len;
+        GB.bit.b.val= 0;
+    } else if (IsInInterval (GB.pulse.p.len, &GB.bit1)) {
+        GB.bit.b.pos= GB.pulse.p.pos;
+        GB.bit.b.len= GB.pulse.p.len;
+        GB.bit.b.val= 1;
+    } else {
+        fprintf(stderr,
+                "BitRead: after valid bits found non-bit at"
+                " %06lx (len=%ld); reset state\n",
+                GB.pulse.p.pos, GB.pulse.p.len);
+        GB.bit.sta= STA_EOF;
+        return EOF;
+    }
+
     return 0;
+}
+
+static int BitReadReset (void)
+{
+    GB.pulse.sta= STA_INIT;
+    GB.bit.sta= STA_INIT;
+    return BitRead();
 }
 
 static void DWB_print (size_t psave, size_t nsave, int csave)
@@ -953,6 +985,7 @@ static void DWB_print (size_t psave, size_t nsave, int csave)
                 (unsigned char)csave,
                 (long)nsave);
     }
+    fflush(stdout);
 }
 
 static void DumpWavBytes (void)
@@ -1015,6 +1048,7 @@ static void DP_print (size_t nsave, const Pulse *psave)
             (long)psave->len2,
             (long)nsave);
     }
+    fflush(stdout);
 }
 
 static void DumpPulses (void)
@@ -1053,5 +1087,16 @@ ELEJE:
 
 static void DumpBits (void)
 {
+ELEJE:
     if (GB.bit.sta == STA_INIT) BitRead();
+    while (GB.bit.sta==STA_FILLED) {
+        printf("%06lx: %d (len=%ld)\n",
+            GB.bit.b.pos, GB.bit.b.val, GB.bit.b.len);
+        fflush(stdout);
+        BitRead ();
+    }
+    if (GB.bit.sta==STA_EOF && GB.pulse.sta!=STA_EOF) {
+        BitReadReset();
+        goto ELEJE;
+    }
 }
