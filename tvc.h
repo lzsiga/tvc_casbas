@@ -52,7 +52,7 @@ typedef struct TSECTEND {
    TSECTHDR  2 bytes (sectno==0)
    fnamelen  1 byte  (max 10)
    fname     0-10 byte
-   PRGFILEHDR 16 byte (csak TBLOCKHDR.filetype==TBLOCKHDR_FILE_UNBUFF esetén)
+   PRGFILEHDR 16 byte (csak TBLOCKHDR.filetype==TBLOCKHDR_FILE_UNBUFF eseten)
    TSECTEND  3 bytes
    (lead off: 5*470usec)
  */
