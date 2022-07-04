@@ -1,6 +1,6 @@
 # Makefile
 
-CFLAGS += -g -W -Wall -pedantic
+CFLAGS += -g -W -Wall -pedantic -Werror
 LDFLAGS += -g
 
 all: casbas wavread
