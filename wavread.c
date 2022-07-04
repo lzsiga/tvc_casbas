@@ -1,6 +1,7 @@
 /* wavread.c */
 
 #include <errno.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,26 +25,6 @@ static struct {
     0,
     0
 };
-
-typedef struct ImpInfo {
-    long begin;
-    long h;
-    long l;
-    long cnt;
-} ImpInfo;
-
-typedef struct HalfImpInfo {
-    int dir;
-    long begin;
-    long igncnt;
-    long cnt;
-    long totcnt;
-} HalfImpInfo;
-
-typedef struct ByteInfo {
-    long begin;
-    long cnt;
-} ByteInfo;
 
 /* SIGN | usec | bytes (depending on Hertz) | factor to lead */
 /*      |      | 38400  44100  48000        | */
@@ -82,22 +63,19 @@ typedef struct Seq {
 /* but you can call PulseReadReset to go back to the initial state */
 #define MINZEROES 1000 /* minimum number of 0x80 bytes (silence) before the leader */
 typedef struct Pulse {
-    long pos;    /* file-offset */
-    long len;    /* length: total */
+    WavPos wp;
     long len1, len2;
 } Pulse;
 
 /* a Bit: reading bits is possible after having found a synchron-block */
 /* there is BitReadReset that resets state */
 typedef struct Bit {
-    long pos;    /* file-offset */
-    long len;    /* length */
+    WavPos wp;
     int  val;    /* 0/1 */
 } Bit;
 
 typedef struct Byte {
-    long pos;    /* file-offset */
-    long len;    /* length */
+    WavPos wp;
     int  val;    /* 0..255 */
 } Byte;
 
@@ -230,18 +208,23 @@ int main (int argc, char **argv)
     while (1) {
         WavPos wp;
 HEADWAIT:
+        ByteReadReset();
+        if (GB.wav.sta==STA_EOF) break;
+
         GetBytes (&tbh, sizeof (tbh), &wp);
         if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_HEAD, wp.pos)) continue;
 HEADFOUND:
         GetBytes (&tsh, sizeof (tsh), NULL);
         if ((ss= tsh.size)==0) ss= 256;
         GetBytes (sect, ss, NULL);
-        printf ("name is \"%.*s\"\n", sect[0], sect+1);
+        fprintf (stderr,"name is \"%.*s\"\n", sect[0], sect+1);
         StartCas (sect[0], sect+1);
         WriteCas (ss-1-sect[0], sect+1+sect[0]);
 
         GetBytes (&tse, sizeof (tse), &wp);
-        printf ("%lx -----HEAD----END----\n", wp.pos);
+        fprintf (stderr,"%lx -----HEAD----END----\n", wp.pos);
+
+        ByteReadReset();
 
         GetBytes (&tbh, sizeof (tbh), &wp);
         if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_DATA, wp.pos)) {
@@ -254,19 +237,19 @@ HEADFOUND:
         for (i=0; i<tbh.nsect; ++i) {
             GetBytes (&tsh, sizeof (tsh), &wp);
             if (tsh.sectno != i+1) {
-                printf ("Bad sector number %d (waited=%d), aborting\n",
+                fprintf (stderr,"Bad sector number %d (waited=%d), aborting\n",
                         tsh.sectno, i+1);
                 AbortCas ();
                 goto HEADWAIT;
             }
-            printf ("%lx -----SECTOR-%d-BEGIN---\n", wp.pos, i+1);
+            fprintf (stderr,"%lx -----SECTOR-%d-BEGIN---\n", wp.pos, i+1);
             if ((ss= tsh.size)==0) ss= 256;
             GetBytes (sect, ss, &wp);
             WriteCas (ss, sect);
             GetBytes (&tse, sizeof (tse), &wp);
-            printf ("%lx -----SECTOR-%d-END---\n", wp.pos, i+1);
+            fprintf (stderr,"%lx -----SECTOR-%d-END---\n", wp.pos, i+1);
         }
-        printf ("%lx -----DATA-END---\n", wp.pos);
+        fprintf (stderr,"%lx -----DATA-END---\n", wp.pos);
         CloseCas ();
     }
 VEGE:
@@ -285,7 +268,7 @@ static int BlockCheck (const TBLOCKHDR *tbh, int type, long pos)
         return -1;
 
     } else if (tbh->blocktype != type) {
-        printf ("%lx Wrong block type %02x, ignoring\n", pos, 
+        fprintf (stderr,"%lx Wrong block type %02x, ignoring\n", pos, 
                 tbh->blocktype);
         return -1;
     }
@@ -298,15 +281,26 @@ static int GetBytes (void *to, int size, WavPos *wp)
     unsigned char *p = to;
     WavPos mywp;
 
+    if (GB.byte.sta==STA_INIT) {
+        ByteRead();
+    }
+
     if (!wp) wp= &mywp;
     wp->pos= wp->len= 0;
 /*  wp= GB.byte.b.wp; <FIXME> */
     for (i=0; i<size && GB.byte.sta==STA_FILLED; ++i) {
+        if (i==0) *wp= GB.byte.b.wp;
+        else      wp->len += GB.byte.b.wp.len;
         p[i]= (unsigned char)GB.byte.b.val;
         ByteRead();
     }
     if (opt.debug) {
         Dump (wp->pos, i, p);
+    }
+    if (i != size) {
+        fprintf(stderr, "GetBytes: incomplete read %d vs %d\n",
+            (int)i, (int)size);
+        exit (12);
     }
     return i;
 }
@@ -318,11 +312,11 @@ static void Dump (long pos, int n, const void *p)
 
     ptr= p;
 
-    printf ("%06lx ", pos);
+    fprintf (stderr,"%06lx ", pos);
     for (j=0; j<n; ++j) {
-        printf ("%02x ", ptr[j]);
+        fprintf (stderr,"%02x ", ptr[j]);
     }
-    printf ("\n");
+    fprintf (stderr,"\n");
 }
 
 static void CalcIntervals (double avgheadlen);
@@ -426,12 +420,17 @@ static void AbortCas (void)
 static void StartCas (size_t namelen, const char *name)
 {
     CPMHDR cpm;
+    unsigned i;
 
     if (CasState) {
         AbortCas ();
     }
     CasName = emalloc (namelen+4+1);
     sprintf (CasName, "%.*s.cas", (int)namelen, name);
+    for (i=0; i<namelen; ++i) {
+        if (!isalnum(CasName[i]) && !strchr("-_@", CasName[i]))
+            CasName[i]= '_';
+    }
     CasFile = efopen (CasName, "wb");
     CasState= 1;
 
@@ -650,8 +649,8 @@ static int PulseRead (void)
         return EOF;
     }
     SeqRead();
-    GB.pulse.p.pos= sFirst.wp.pos;
-    GB.pulse.p.len= sFirst.wp.len + sNext.wp.len;
+    GB.pulse.p.wp.pos= sFirst.wp.pos;
+    GB.pulse.p.wp.len= sFirst.wp.len + sNext.wp.len;
     GB.pulse.p.len1= sFirst.wp.len;
     GB.pulse.p.len2= sNext.wp.len;
     GB.pulse.sta= STA_FILLED;
@@ -675,8 +674,8 @@ static int BitRead_FindSync()
     for (j= 0; j<leadtries && !leadfound; ++j) {
         sumlen= 0;
         for (i=0; i<leadunit && GB.pulse.sta==STA_FILLED; ++i) {
-    /*      printf ("pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
-            sumlen += GB.pulse.p.len;
+    /*      fprintf (stderr,"pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
+            sumlen += GB.pulse.p.wp.len;
             PulseRead();
         }
         if (GB.pulse.sta==STA_EOF) {
@@ -691,8 +690,8 @@ static int BitRead_FindSync()
 
         int rngerr= 0;
         for (i=0; i<leadunit && !rngerr && GB.pulse.sta==STA_FILLED; ++i) {
-    /*      printf ("pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
-            rngerr= ! IsInInterval (GB.pulse.p.len, &range);
+    /*      fprintf (stderr,"pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
+            rngerr= ! IsInInterval (GB.pulse.p.wp.len, &range);
             if (rngerr) continue;
             PulseRead();
         }
@@ -709,15 +708,15 @@ static int BitRead_FindSync()
     }
     CalcIntervals (headavglen);
     while (GB.pulse.sta != STA_EOF &&
-           IsInInterval (GB.pulse.p.len, &GB.lead)) {
+           IsInInterval (GB.pulse.p.wp.len, &GB.lead)) {
         PulseRead();
     }
     if (GB.pulse.sta != STA_EOF &&
-           IsInInterval (GB.pulse.p.len, &GB.sync)) {
+           IsInInterval (GB.pulse.p.wp.len, &GB.sync)) {
         fprintf (stderr, "BitRead_FindSync: found the sync at %06lx-%06lx (len=%d)\n",
-            (long)GB.pulse.p.pos,
-            (long)GB.pulse.p.pos + (int)GB.pulse.p.len,
-            (int)GB.pulse.p.len);
+            (long)GB.pulse.p.wp.pos,
+            (long)(GB.pulse.p.wp.pos + GB.pulse.p.wp.len),
+            (int)GB.pulse.p.wp.len);
         GB.bit.sta= STA_FILLED;
         PulseRead();
         return 0;
@@ -745,19 +744,17 @@ static int BitRead (void)
         GB.bit.sta= STA_EOF;
         return EOF;
     }
-    if (IsInInterval (GB.pulse.p.len, &GB.bit0)) {
-        GB.bit.b.pos= GB.pulse.p.pos;
-        GB.bit.b.len= GB.pulse.p.len;
+    if (IsInInterval (GB.pulse.p.wp.len, &GB.bit0)) {
+        GB.bit.b.wp= GB.pulse.p.wp;
         GB.bit.b.val= 0;
-    } else if (IsInInterval (GB.pulse.p.len, &GB.bit1)) {
-        GB.bit.b.pos= GB.pulse.p.pos;
-        GB.bit.b.len= GB.pulse.p.len;
+    } else if (IsInInterval (GB.pulse.p.wp.len, &GB.bit1)) {
+        GB.bit.b.wp= GB.pulse.p.wp;
         GB.bit.b.val= 1;
     } else {
         fprintf(stderr,
                 "BitRead: after valid bits found non-bit at"
                 " %06lx (len=%ld); reset state\n",
-                GB.pulse.p.pos, GB.pulse.p.len);
+                GB.pulse.p.wp.pos, GB.pulse.p.wp.len);
         GB.bit.sta= STA_EOF;
         return EOF;
     }
@@ -787,8 +784,11 @@ static int ByteRead (void)
     int nbit= 0;
     int byteval= 0;
     while (nbit<8 && GB.bit.sta==STA_FILLED) {
-        if (nbit==0) GB.byte.b.pos= GB.bit.b.pos;
-        GB.byte.b.len += GB.bit.b.len;
+        if (nbit==0) {
+            GB.byte.b.wp= GB.bit.b.wp;
+        } else {
+            GB.byte.b.wp.len += GB.bit.b.wp.len;
+        }
         byteval >>= 1;
         if (GB.bit.b.val==1) byteval |= 0x80;
         ++nbit;
@@ -800,7 +800,7 @@ static int ByteRead (void)
     } else {
         if (nbit != 0) {
             fprintf (stderr, "ByteRead: incomplete byte read pos=%06lx nbit=%d\n",
-                (long)GB.byte.b.pos, nbit);
+                (long)GB.byte.b.wp.pos, nbit);
         }
         GB.byte.sta= STA_EOF;
         return EOF;
@@ -817,11 +817,11 @@ static int ByteReadReset (void)
 static void DWB_print (size_t psave, size_t nsave, int csave)
 {
     if (nsave==1) {
-        printf ("%06lx: %02x\n",
+        fprintf (stderr,"%06lx: %02x\n",
                 (long)psave,
                 (unsigned char)csave);
     } else {
-        printf ("%06lx= %02x (*%ld)\n",
+        fprintf (stderr,"%06lx= %02x (*%ld)\n",
                 (long)psave,
                 (unsigned char)csave,
                 (long)nsave);
@@ -865,7 +865,7 @@ static void DumpSequences (void)
     if (GB.seq.sta == STA_INIT) SeqRead();
 
     while (GB.seq.sta == STA_FILLED) {
-        printf ("%06lx: %c *%ld\n",
+        fprintf (stderr,"%06lx: %c *%ld\n",
             (long)GB.seq.s.wp.pos,
             SignToChar (GB.seq.s.sign),
             (long)GB.seq.s.wp.len);
@@ -876,15 +876,15 @@ static void DumpSequences (void)
 static void DP_print (size_t nsave, const Pulse *psave)
 {
     if (nsave==1) {
-        printf ("%06lx: %ld (%ld+%ld)\n",
-            (long)psave->pos,
-            (long)psave->len,
+        fprintf (stderr,"%06lx: %ld (%ld+%ld)\n",
+            (long)psave->wp.pos,
+            (long)psave->wp.len,
             (long)psave->len1,
             (long)psave->len2);
     } else {
-        printf ("%06lx= %ld (%ld+%ld) (*%ld)\n",
-            (long)psave->pos,
-            (long)psave->len,
+        fprintf (stderr,"%06lx= %ld (%ld+%ld) (*%ld)\n",
+            (long)psave->wp.pos,
+            (long)psave->wp.len,
             (long)psave->len1,
             (long)psave->len2,
             (long)nsave);
@@ -905,9 +905,9 @@ ELEJE:
             DP_print (1, &GB.pulse.p);
         } else {
             if (ncache!=0 &&
-                (GB.pulse.p.len  != pcache.len  ||
-                 GB.pulse.p.len1 != pcache.len1 ||
-                 GB.pulse.p.len2 != pcache.len2)) {
+                (GB.pulse.p.wp.len != pcache.wp.len  ||
+                 GB.pulse.p.len1   != pcache.len1 ||
+                 GB.pulse.p.len2   != pcache.len2)) {
                 DP_print (ncache, &pcache);
                 ncache= 0;
             }
@@ -936,7 +936,7 @@ ELEJE:
     if (GB.bit.sta == STA_INIT) BitRead();
     while (GB.bit.sta==STA_FILLED) {
         printf("%06lx: %d (len=%ld)\n",
-            GB.bit.b.pos, GB.bit.b.val, GB.bit.b.len);
+            GB.bit.b.wp.pos, GB.bit.b.val, GB.bit.b.wp.len);
         fflush(stdout);
         BitRead ();
     }
@@ -952,7 +952,7 @@ ELEJE:
     if (GB.byte.sta == STA_INIT) ByteRead();
     while (GB.byte.sta==STA_FILLED) {
         printf("%06lx: %02x (len=%ld)\n",
-            GB.byte.b.pos, GB.byte.b.val, GB.byte.b.len);
+            GB.byte.b.wp.pos, GB.byte.b.val, GB.byte.b.wp.len);
         fflush(stdout);
         ByteRead ();
     }
