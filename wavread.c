@@ -17,8 +17,10 @@ static struct {
     const char *progname;
     int action;
     int debug;
+    int nocache;
 } opt = {
     "wavread",
+    0,
     0,
     0
 };
@@ -61,12 +63,16 @@ typedef struct lenrange {
     (((long)(val)) >= (long)(plenrange)->minv && \
      ((long)(val)) <= (long)(plenrange)->maxv)
 
+/* position and length in the WAV-file */
+typedef struct WavPos {
+    long pos, len;
+} WavPos;
+
 /* sequence-read */
 /* a sequence consist of consecutive positive/negative/zero bytes (here 0x80 is zero) */
 typedef struct Seq {
-    long pos;    /* file-offset */
+    WavPos wp;
     int  sign;   /* -1/0/1 */
-    long len;
 } Seq;
 
 /* an impulse: a positive and a negative part together */
@@ -166,18 +172,10 @@ static int BitReadReset (void);
 static int ByteRead (void);
 static int ByteReadReset (void);
 
-/* 'Zero' is 0x80 in this context; 0x00..0x7f is negative, 0x81..0xff is positive */
-static int WaitZero ();
-
-static long GetHalfImp (FILE *f, HalfImpInfo *inf);
-static long GetImp (ImpInfo *ii);
-static int  GetByte (ByteInfo *inf);
-
-static int GetBytes (void *to, int size);
+/* 'wp' parameter: returns the position of the first bit in the block */
+static int GetBytes (void *to, int size, WavPos *wp);
 
 static void Dump (long pos, int n, const void *p);
-
-static long ninwav= 0;
 
 static int BlockCheck (const TBLOCKHDR *tbh, int type, long pos);
 
@@ -194,14 +192,11 @@ static void DumpBytes (void);
 
 int main (int argc, char **argv)
 {
-    int b, ss, i;
+    int ss, i;
     TBLOCKHDR tbh;
     TSECTHDR  tsh;
     TSECTEND  tse;
     char sect [280];
-    long n;
-    long pos;
-    int leave, rc;
 
     ParseArgs (&argc, &argv);
 
@@ -230,89 +225,48 @@ int main (int argc, char **argv)
     } else if (opt.action==ACT_BYTEREAD) {
         DumpBytes();
         goto VEGE;
-
-    } else if (opt.action==1) {
-        ImpInfo ii;
-        n= 0;
-        while (GetImp (&ii)!=EOF) {
-            printf ("%05ld %06lx-%06lx %ld+%ld=%ld\n",
-                    ++n, ii.begin, ii.begin + ii.cnt - 1,
-                    ii.h, ii.l, ii.cnt);
-        }
-        exit (12);
-
-    } else if (opt.action==2) {
-        HalfImpInfo ii;
-        n= 0;
-        while (GetHalfImp (NULL, &ii)!=EOF) {
-            printf ("%05ld %06lx-%06lx %c %ld+%2ld = %2ld\n",
-                    ++n, ii.begin, ii.begin + ii.totcnt - 1,
-                    ii.dir>0 ? '+' : '-', 
-                    ii.igncnt, ii.cnt, ii.totcnt);
-        }
-        goto VEGE;
-
-    } else if (opt.action==3) {
-        n= 0;
-        for (leave= 0; ! leave; ) {
-            while ((b= GetByte (NULL))>=0) {
-                printf ("%05ld   %02x\n", ++n, b);
-            }
-            printf ("-----\n");
-
-            leave= WaitZero ()==EOF;
-        }
-        goto VEGE;
     }
 
     while (1) {
+        WavPos wp;
 HEADWAIT:
-        rc= WaitZero ();
-        if (rc==EOF) break;
-
-        pos = ninwav;
-        GetBytes (&tbh, sizeof (tbh));
-        if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_HEAD, pos)) continue;
+        GetBytes (&tbh, sizeof (tbh), &wp);
+        if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_HEAD, wp.pos)) continue;
 HEADFOUND:
-        GetBytes (&tsh, sizeof (tsh));
+        GetBytes (&tsh, sizeof (tsh), NULL);
         if ((ss= tsh.size)==0) ss= 256;
-        GetBytes (sect, ss);
+        GetBytes (sect, ss, NULL);
         printf ("name is \"%.*s\"\n", sect[0], sect+1);
         StartCas (sect[0], sect+1);
         WriteCas (ss-1-sect[0], sect+1+sect[0]);
 
-        GetBytes (&tse, sizeof (tse));
-        printf ("%lx -----HEAD----END----\n", ninwav);
+        GetBytes (&tse, sizeof (tse), &wp);
+        printf ("%lx -----HEAD----END----\n", wp.pos);
 
-        WaitZero ();
-
-        pos = ninwav;
-        GetBytes (&tbh, sizeof (tbh));
-        if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_DATA, pos)) {
+        GetBytes (&tbh, sizeof (tbh), &wp);
+        if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_DATA, wp.pos)) {
             AbortCas ();
-            if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_HEAD, pos) == 0)
+            if (BlockCheck (&tbh, TBLOCKHDR_BLOCK_HEAD, wp.pos) == 0)
                 goto HEADFOUND;
             else
                 continue;
         }
         for (i=0; i<tbh.nsect; ++i) {
-            pos = ninwav;
-                GetBytes (&tsh, sizeof (tsh));
+            GetBytes (&tsh, sizeof (tsh), &wp);
             if (tsh.sectno != i+1) {
                 printf ("Bad sector number %d (waited=%d), aborting\n",
                         tsh.sectno, i+1);
                 AbortCas ();
                 goto HEADWAIT;
             }
-            printf ("%lx -----SECTOR-%d-BEGIN---\n", pos, i+1);
+            printf ("%lx -----SECTOR-%d-BEGIN---\n", wp.pos, i+1);
             if ((ss= tsh.size)==0) ss= 256;
-                GetBytes (sect, ss);
+            GetBytes (sect, ss, &wp);
             WriteCas (ss, sect);
-            pos = ninwav;
-                GetBytes (&tse, sizeof (tse));
-            printf ("%lx -----SECTOR-%d-END---\n", pos, i+1);
+            GetBytes (&tse, sizeof (tse), &wp);
+            printf ("%lx -----SECTOR-%d-END---\n", wp.pos, i+1);
         }
-        printf ("%lx -----DATA-END---\n", ninwav);
+        printf ("%lx -----DATA-END---\n", wp.pos);
         CloseCas ();
     }
 VEGE:
@@ -338,22 +292,21 @@ static int BlockCheck (const TBLOCKHDR *tbh, int type, long pos)
     return 0;
 }
 
-static int GetBytes (void *to, int size)
+static int GetBytes (void *to, int size, WavPos *wp)
 {
     int i;
     unsigned char *p = to;
-    int c;
-    long pos;
+    WavPos mywp;
 
-    pos = ninwav;
-
-    for (i=0; i<size; ++i) {
-        c= GetByte (NULL);
-        if (c<0) break;
-        p[i]= (unsigned char)c;
+    if (!wp) wp= &mywp;
+    wp->pos= wp->len= 0;
+/*  wp= GB.byte.b.wp; <FIXME> */
+    for (i=0; i<size && GB.byte.sta==STA_FILLED; ++i) {
+        p[i]= (unsigned char)GB.byte.b.val;
+        ByteRead();
     }
     if (opt.debug) {
-        Dump (pos, i, p);
+        Dump (wp->pos, i, p);
     }
     return i;
 }
@@ -372,194 +325,7 @@ static void Dump (long pos, int n, const void *p)
     printf ("\n");
 }
 
-#define MINSYNC 29
-
 static void CalcIntervals (double avgheadlen);
-
-static int GetByte (ByteInfo *bi)
-{
-    long pos;
-    long cnt;
-    int bits, byte;
-    int ok;
-    ImpInfo ii;
-
-    if (GB.state==0) {
-        long sum= 0;
-
-/* szinkront keresunk */
-        for (ok= 0, cnt= 0; ok<100; ) {
-            if (cnt>=17 && cnt<=25) {
-                ok++;
-                sum += cnt;
-            } else {
-                ok= 0;
-                sum= 0;
-            }
-            cnt= GetImp (&ii);
-            if (cnt==EOF) return EOF;
-        }
-        CalcIntervals ((double)sum/ok);
-
-        while (cnt>=GB.lead.minv && cnt<=GB.lead.maxv) {
-            cnt= GetImp (&ii);
-            if (cnt==EOF) return EOF;
-        }
-        GB.state= 1;
-        goto S1;
-
-    } else if (GB.state==1) {
-        cnt = GetImp (&ii);
-S1:     if (cnt<GB.sync.minv || cnt>GB.sync.maxv) {
-            fprintf (stderr, "Missed sync (expected %d-%d, found=%ld\n",
-                     GB.sync.minv, GB.sync.maxv, cnt);
-            exit (12);
-        }
-        fprintf (stderr, "%lx Sync found len=%ld\n", ii.begin, ii.cnt);
-        GB.state= 2;
-        goto S2;
-
-    } else if (GB.state==2) {
-S2:     pos = ninwav;
-        for (bits= 0, byte= 0; bits<8; ++bits) {
-            byte >>= 1;
-            cnt = GetImp (&ii);
-            if      (cnt>=GB.bit0.minv && cnt<=GB.bit0.maxv) byte |= 0;
-            else if (cnt>=GB.bit1.minv && cnt<=GB.bit1.maxv) byte |= 0x80;
-            else {             /* nem jo adatbit */
-                if (bits==0) { /* szerencsere byte-hataron jott */
-                    GB.state= 0;
-                    return -2;
-                } else {
-                    fprintf (stderr, "cnt=%ld unknown (at %lx)\n", cnt, ii.begin);
-                    exit (44);
-                }
-            }
-        }
-        if (bi) {
-            bi->begin = pos;
-            bi->cnt   = ninwav - pos;
-        }
-        return byte;
-    }
-    return EOF;
-}
-
-static int WaitZero ()
-{
-    int c;
-
-    do {
-        c= WavRead ();
-        if (c==EOF) return EOF;
-    } while (c!=0x80);
-
-    GB.state = 0;
-
-    return 0;
-}
-
-#define Poz() \
-    while (c>0x80) { \
-        ++hcnt; \
-        ++cnt; \
-        c= WavRead (); \
-        if (c==EOF) return EOF; \
-    }
-
-#define Neg() \
-    while (c<=0x80) { \
-        ++lcnt; \
-        ++cnt; \
-        c= WavRead (); \
-        if (c==EOF) return EOF; \
-    }
-
-static long GetImp (ImpInfo *inf)
-{
-    int c;
-    long cnt, hcnt, lcnt;
-    long pos;
-
-    pos = ninwav;
-
-/* Megvárjuk egy impulzus elejét
-    do {
-        c= WavRead ();
-        if (c==EOF) return EOF;
-    } while (c<0x80);
-*/
-
-    cnt= 0;
-    hcnt= 0;
-    lcnt= 0;
-
-    c= WavRead ();
-    if (c==EOF) return EOF;
-
-    Neg ();
-    Poz ();
-
-/*  WavUnread (c, f); */
-
-    if (inf) {
-        inf->begin = pos;
-        inf->h = hcnt;
-        inf->l = lcnt;
-        inf->cnt = cnt;
-    }
-
-    return cnt;
-}
-
-static long GetHalfImp (FILE *f, HalfImpInfo *inf)
-{
-    int c, dir;
-    long cnt, igncnt;
-    long pos;
-
-    (void)f;
-    pos = ninwav;
-    igncnt = 0;
-    cnt = 0;
-
-/* Megvárjuk egy impulzus elejét */
-    c= WavRead ();
-    if (c==EOF) return EOF;
-
-    while (c==0x80) {
-        ++igncnt;
-        c= WavRead ();
-        if (c==EOF) return EOF;
-    }
-
-    if (c>0x80) {
-        dir = 1; /* pozitív */
-        while (c>=0x7e) {
-            ++cnt;
-            c= WavRead ();
-            if (c==EOF) return EOF;
-        }
-    } else {
-        dir = -1; /* negatív */
-        while (c<=0x82) {
-            ++cnt;
-            c= WavRead ();
-            if (c==EOF) return EOF;
-        }
-    }
-/* WavUnread (c, f); */
-
-    if (inf) {
-        inf->begin = pos;
-        inf->igncnt = igncnt;
-        inf->cnt = cnt;
-        inf->totcnt = igncnt + cnt;
-        inf->dir = dir;
-    }
-
-    return cnt;
-}
 
 static FILE *efopen (const char *name, const char *mode)
 {
@@ -605,6 +371,12 @@ static void ParseArgs (int *pargc, char ***pargv)
         case 'i': case 'I':
             opt.action = 1;
             break;
+
+        case 'n': case 'N':
+            if (strcasecmp (argv[0], "-nocache")==0) {
+                opt.nocache= 1;
+                break;
+            } goto UNKOPT;
 
         case 'p': case 'P':
             if (strcasecmp (argv[0], "-pulseread")==0) {
@@ -807,14 +579,14 @@ static int SeqRead (void)
     }
 
     GB.seq.sta= STA_FILLED;
-    GB.seq.s.pos= GB.wav.pos;
-    GB.seq.s.len= 1;
+    GB.seq.s.wp.pos= GB.wav.pos;
+    GB.seq.s.wp.len= 1;
     GB.seq.s.sign= SignOfByte (GB.wav.cache);
     WavRead();
 
     while (GB.wav.sta == STA_FILLED &&
            SignOfByte(GB.wav.cache)==GB.seq.s.sign) {
-        ++GB.seq.s.len;
+        ++GB.seq.s.wp.len;
         WavRead();
     }
     return 0;
@@ -835,7 +607,7 @@ static int PulseRead (void)
         int foundzeroes= 0;
 
         while (GB.seq.sta==STA_FILLED && !foundzeroes) {
-            foundzeroes= GB.seq.s.sign==0 && GB.seq.s.len >= MINZEROES;
+            foundzeroes= GB.seq.s.sign==0 && GB.seq.s.wp.len >= MINZEROES;
             if (foundzeroes) sZero= GB.seq.s;
             SeqRead();
         }
@@ -847,7 +619,7 @@ static int PulseRead (void)
         fprintf(stderr,
                 "PulseRead: found zeroes at"
                 " %06lx (len=%ld), data after it at %06lx\n",
-                sZero.pos, sZero.len, sFirst.pos);
+                sZero.wp.pos, sZero.wp.len, sFirst.wp.pos);
         sFirst= GB.seq.s;
     } else {
         sFirst= GB.seq.s;
@@ -855,7 +627,7 @@ static int PulseRead (void)
             fprintf(stderr,
                 "PulseRead: after valid impulse found zeroes at"
                 " %06lx (len=%ld); reset state\n",
-                sFirst.pos, sFirst.len);
+                sFirst.wp.pos, sFirst.wp.len);
             GB.pulse.sta= STA_EOF;
             return EOF;
         }
@@ -872,16 +644,16 @@ static int PulseRead (void)
         fprintf(stderr,
                 "The halves of the pulse doesn't match"
                 " p=%06lx/l=%ld/s=%d vs p=%06lx/l=%ld/s=%d\n",
-                (long)sFirst.pos, (long)sFirst.len, (int)sFirst.sign,
-                (long)sNext.pos,  (long)sNext.len,  (int)sNext.sign);
+                (long)sFirst.wp.pos, (long)sFirst.wp.len, (int)sFirst.sign,
+                (long)sNext.wp.pos,  (long)sNext.wp.len,  (int)sNext.sign);
         GB.pulse.sta= STA_EOF;
         return EOF;
     }
     SeqRead();
-    GB.pulse.p.pos= sFirst.pos;
-    GB.pulse.p.len= sFirst.len + sNext.len;
-    GB.pulse.p.len1= sFirst.len;
-    GB.pulse.p.len2= sNext.len;
+    GB.pulse.p.pos= sFirst.wp.pos;
+    GB.pulse.p.len= sFirst.wp.len + sNext.wp.len;
+    GB.pulse.p.len1= sFirst.wp.len;
+    GB.pulse.p.len2= sNext.wp.len;
     GB.pulse.sta= STA_FILLED;
     return 0;
 }
@@ -942,8 +714,10 @@ static int BitRead_FindSync()
     }
     if (GB.pulse.sta != STA_EOF &&
            IsInInterval (GB.pulse.p.len, &GB.sync)) {
-        fprintf (stderr, "BitRead_FindSync: found the sync at %06lx (len=%d)\n",
-            (long)GB.pulse.p.pos, (int)GB.pulse.p.len);
+        fprintf (stderr, "BitRead_FindSync: found the sync at %06lx-%06lx (len=%d)\n",
+            (long)GB.pulse.p.pos,
+            (long)GB.pulse.p.pos + (int)GB.pulse.p.len,
+            (int)GB.pulse.p.len);
         GB.bit.sta= STA_FILLED;
         PulseRead();
         return 0;
@@ -964,8 +738,9 @@ static int BitRead (void)
     if (GB.bit.sta==STA_INIT) {
         int rc= BitRead_FindSync();
         if (rc) return STA_EOF;
+    } else {
+        PulseRead();
     }
-    PulseRead();
     if (GB.pulse.sta==STA_EOF) {
         GB.bit.sta= STA_EOF;
         return EOF;
@@ -1091,9 +866,9 @@ static void DumpSequences (void)
 
     while (GB.seq.sta == STA_FILLED) {
         printf ("%06lx: %c *%ld\n",
-            (long)GB.seq.s.pos,
+            (long)GB.seq.s.wp.pos,
             SignToChar (GB.seq.s.sign),
-            (long)GB.seq.s.len);
+            (long)GB.seq.s.wp.len);
         SeqRead();
     }
 }
@@ -1126,18 +901,22 @@ static void DumpPulses (void)
 
 ELEJE:
     while (GB.pulse.sta == STA_FILLED) {
-        if (ncache!=0 &&
-            (GB.pulse.p.len  != pcache.len  ||
-             GB.pulse.p.len1 != pcache.len1 ||
-             GB.pulse.p.len2 != pcache.len2)) {
-            DP_print (ncache, &pcache);
-            ncache= 0;
-        }
-        if (ncache==0) {
-            ncache= 1;
-            pcache= GB.pulse.p;
+        if (opt.nocache) {
+            DP_print (1, &GB.pulse.p);
         } else {
-            ++ncache;
+            if (ncache!=0 &&
+                (GB.pulse.p.len  != pcache.len  ||
+                 GB.pulse.p.len1 != pcache.len1 ||
+                 GB.pulse.p.len2 != pcache.len2)) {
+                DP_print (ncache, &pcache);
+                ncache= 0;
+            }
+            if (ncache==0) {
+                ncache= 1;
+                pcache= GB.pulse.p;
+            } else {
+                ++ncache;
+            }
         }
         PulseRead ();
     }
