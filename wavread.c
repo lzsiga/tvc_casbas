@@ -12,6 +12,7 @@
 #define ACT_SEQREAD   2
 #define ACT_PULSEREAD 3
 #define ACT_BITREAD   4
+#define ACT_BYTEREAD  5
 static struct {
     const char *progname;
     int action;
@@ -88,14 +89,22 @@ typedef struct Bit {
     int  val;    /* 0/1 */
 } Bit;
 
+typedef struct Byte {
+    long pos;    /* file-offset */
+    long len;    /* length */
+    int  val;    /* 0..255 */
+} Byte;
+
 /* hierachy of read-operations:
    WavOpen   calls WavRead
    WavOpen   sets GB.seq.sta   to STA_INIT
    WavOpen   sets GB.pulse.sta to STA_INIT
-   WavOpen   sets GB.BIpulse.sta to STA_INIT
+   WavOpen   sets GB.bit.sta   to STA_INIT
+   WavOpen   sets GB.byte.sta  to STA_INIT
    SeqRead   calls WavRead
    PulseRead calls SeqRead
    BitRead   calls PulseRead
+   ByteRead  calls BitRead
  */
 #define STA_FILLED 0
 #define STA_EOF    (-1)
@@ -125,6 +134,10 @@ typedef struct State {
         int sta;     /* 0/-1/1 = next field is filled / EOF / before the first read */
         Bit b;
     } bit;
+    struct {
+        int sta;     /* 0/-1/1 = next field is filled / EOF / before the first read */
+        Byte b;
+    } byte;
     int state;
 /* the following values are calculated from the measured 'lead'-length */
     lenrange lead;
@@ -150,6 +163,8 @@ static int PulseRead (void);
 static int PulseReadReset (void);
 static int BitRead (void);
 static int BitReadReset (void);
+static int ByteRead (void);
+static int ByteReadReset (void);
 
 /* 'Zero' is 0x80 in this context; 0x00..0x7f is negative, 0x81..0xff is positive */
 static int WaitZero ();
@@ -175,6 +190,7 @@ static void DumpWavBytes (void);
 static void DumpSequences (void);
 static void DumpPulses (void);
 static void DumpBits (void);
+static void DumpBytes (void);
 
 int main (int argc, char **argv)
 {
@@ -209,6 +225,10 @@ int main (int argc, char **argv)
 
     } else if (opt.action==ACT_BITREAD) {
         DumpBits();
+        goto VEGE;
+
+    } else if (opt.action==ACT_BYTEREAD) {
+        DumpBytes();
         goto VEGE;
 
     } else if (opt.action==1) {
@@ -571,6 +591,9 @@ static void ParseArgs (int *pargc, char ***pargv)
             if (strcasecmp (argv[0], "-bitread")==0) {
                 opt.action= ACT_BITREAD;
                 break;
+            } else if (strcasecmp (argv[0], "-byteread")==0) {
+                opt.action= ACT_BYTEREAD;
+                break;
             } goto UNKOPT;
 
         case 'd': case 'D':
@@ -731,6 +754,7 @@ static void WavOpen (const char *name)
     GB.seq.sta= STA_INIT;
     GB.pulse.sta= STA_INIT;
     GB.bit.sta= STA_INIT;
+    GB.byte.sta= STA_INIT;
 
     GB.fh.len= WavReadBytes (&GB.fh.bytes, sizeof GB.fh.bytes);
     if (opt.debug>=1) {
@@ -968,9 +992,51 @@ static int BitRead (void)
 
 static int BitReadReset (void)
 {
-    GB.pulse.sta= STA_INIT;
     GB.bit.sta= STA_INIT;
+    PulseReadReset();
     return BitRead();
+}
+
+static int ByteRead (void)
+{
+    if (GB.byte.sta == STA_EOF) return EOF;
+    if (GB.bit.sta==STA_INIT) BitRead();
+    if (GB.bit.sta==STA_EOF) {
+        GB.byte.sta= STA_EOF;
+        return EOF;
+    }
+    if (GB.byte.sta==STA_INIT) {
+        GB.byte.sta= STA_FILLED;
+    }
+
+    int nbit= 0;
+    int byteval= 0;
+    while (nbit<8 && GB.bit.sta==STA_FILLED) {
+        if (nbit==0) GB.byte.b.pos= GB.bit.b.pos;
+        GB.byte.b.len += GB.bit.b.len;
+        byteval >>= 1;
+        if (GB.bit.b.val==1) byteval |= 0x80;
+        ++nbit;
+        BitRead();
+    }
+    if (nbit==8) {
+        GB.byte.b.val= byteval;
+        return 0;
+    } else {
+        if (nbit != 0) {
+            fprintf (stderr, "ByteRead: incomplete byte read pos=%06lx nbit=%d\n",
+                (long)GB.byte.b.pos, nbit);
+        }
+        GB.byte.sta= STA_EOF;
+        return EOF;
+    }
+}
+
+static int ByteReadReset (void)
+{
+    GB.byte.sta= STA_INIT;
+    BitReadReset();
+    return ByteRead();
 }
 
 static void DWB_print (size_t psave, size_t nsave, int csave)
@@ -1097,6 +1163,22 @@ ELEJE:
     }
     if (GB.bit.sta==STA_EOF && GB.pulse.sta!=STA_EOF) {
         BitReadReset();
+        goto ELEJE;
+    }
+}
+
+static void DumpBytes (void)
+{
+ELEJE:
+    if (GB.byte.sta == STA_INIT) ByteRead();
+    while (GB.byte.sta==STA_FILLED) {
+        printf("%06lx: %02x (len=%ld)\n",
+            GB.byte.b.pos, GB.byte.b.val, GB.byte.b.len);
+        fflush(stdout);
+        ByteRead ();
+    }
+    if (GB.byte.sta==STA_EOF && GB.pulse.sta!=STA_EOF) { /* tranzitiv fugges */
+        ByteReadReset();
         goto ELEJE;
     }
 }
