@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_Windows)
+#define strcasecmp(s,t) strcmpi(s,t)
+#endif
+
 #include "tvc.h"
 
 #define ACT_WAVREAD   1
@@ -467,21 +471,24 @@ static void *emalloc (int n)
 
 static void ceil_floor (double base, double fact1, double fact2, int *h1, int *l2)
 {
+    double v1, fv1, cv1, fault1c;
+    double v2, fv2, cv2, fault2f;
+
     if (base <= 0 || fact1 >= fact2) {
         fprintf (stderr, "*** ceil_floor: invalid parameters: %g %g %g\n",
             base, fact1, fact2);
         exit(12);
     }
 
-    double v1= base*fact1;
-    double fv1= floor(v1);
-    double cv1= ceil(v1);
-    double fault1c= cv1 - v1;
+    v1= base*fact1;
+    fv1= floor(v1);
+    cv1= ceil(v1);
+    fault1c= cv1 - v1;
 
-    double v2= base*fact2;
-    double fv2= floor(v2);
-    double cv2= ceil(v2);
-    double fault2f= v1 - fv2;
+    v2= base*fact2;
+    fv2= floor(v2);
+    cv2= ceil(v2);
+    fault2f= v1 - fv2;
 
     if      (cv1 < fv2) *h1= cv1, *l2= fv2;
     else if (cv1==cv2)  *h1= fv1, *l2= cv2;
@@ -541,9 +548,12 @@ static void WavClose (void)
 }
 
 static int WavRead (void) {
+    int c;
+
     if (GB.wav.sta==STA_EOF) return EOF;
     if (GB.wav.sta!=STA_INIT) ++GB.wav.pos;
-    int c= fgetc (GB.wfile);
+
+    c= fgetc (GB.wfile);
     if (c==EOF) {
         GB.wav.sta= STA_EOF;
     } else {
@@ -554,11 +564,13 @@ static int WavRead (void) {
 }
 
 static size_t WavReadBytes (void *to, size_t len) {
-    if (len==0) return 0;
-    if (GB.wav.sta==STA_EOF) return 0;
     unsigned char *p0= to;
     unsigned char *plim= p0+len;
     unsigned char *p= p0;
+
+    if (len==0) return 0;
+    if (GB.wav.sta==STA_EOF) return 0;
+
     while (p<plim && GB.wav.sta != EOF) {
         *p++ = GB.wav.cache;
         WavRead();
@@ -663,7 +675,7 @@ static int PulseReadReset (void)
     return PulseRead();
 }
 
-static int BitRead_FindSync()
+static int BitRead_FindSync(void)
 {
     size_t sumlen;
     int leadtries= 20, leadunit= 100;
@@ -672,6 +684,9 @@ static int BitRead_FindSync()
     double headavglen;
 
     for (j= 0; j<leadtries && !leadfound; ++j) {
+        lenrange range;
+        int rngerr;
+
         sumlen= 0;
         for (i=0; i<leadunit && GB.pulse.sta==STA_FILLED; ++i) {
     /*      fprintf (stderr,"pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
@@ -683,12 +698,12 @@ static int BitRead_FindSync()
             return STA_EOF;
         }
         headavglen= sumlen/leadunit;
-        lenrange range;
+
         range.minv= floor(headavglen*0.95);
         range.maxv= ceil(headavglen*1.05);
         fprintf (stderr, "BitRead_FindSync: avg=%g range=[%d,%d]\n", headavglen, range.minv, range.maxv);
 
-        int rngerr= 0;
+        rngerr= 0;
         for (i=0; i<leadunit && !rngerr && GB.pulse.sta==STA_FILLED; ++i) {
     /*      fprintf (stderr,"pulse at %06lx len=%ld\n", GB.pulse.p.pos, GB.pulse.p.len); */
             rngerr= ! IsInInterval (GB.pulse.p.wp.len, &range);
@@ -771,6 +786,9 @@ static int BitReadReset (void)
 
 static int ByteRead (void)
 {
+    int nbit= 0;
+    int byteval= 0;
+
     if (GB.byte.sta == STA_EOF) return EOF;
     if (GB.bit.sta==STA_INIT) BitRead();
     if (GB.bit.sta==STA_EOF) {
@@ -781,8 +799,6 @@ static int ByteRead (void)
         GB.byte.sta= STA_FILLED;
     }
 
-    int nbit= 0;
-    int byteval= 0;
     while (nbit<8 && GB.bit.sta==STA_FILLED) {
         if (nbit==0) {
             GB.byte.b.wp= GB.bit.b.wp;
@@ -894,10 +910,10 @@ static void DP_print (size_t nsave, const Pulse *psave)
 
 static void DumpPulses (void)
 {
-    if (GB.pulse.sta == STA_INIT) PulseRead();
-
     Pulse pcache;
     size_t ncache= 0;
+
+    if (GB.pulse.sta == STA_INIT) PulseRead();
 
 ELEJE:
     while (GB.pulse.sta == STA_FILLED) {
